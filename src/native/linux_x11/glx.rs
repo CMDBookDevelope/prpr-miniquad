@@ -312,30 +312,58 @@ impl Glx {
         &mut self,
         display: &mut X11Display,
         window: Window,
+        opengl_version: crate::conf::GlVersion,
     ) -> (GLXContext, GLXWindow) {
         if self.extensions.glxCreateContextAttribsARB.is_none() {
             panic!("GLX: ARB_create_context and ARB_create_context_profile required");
         }
 
-        // _sapp_x11_grab_error_handler(libx11);
-        let attribs: [libc::c_int; 8] = [
-            GLX_CONTEXT_MAJOR_VERSION_ARB,
-            2,
-            GLX_CONTEXT_MINOR_VERSION_ARB,
-            1,
-            GLX_CONTEXT_FLAGS_ARB,
-            GLX_CONTEXT_CORE_PROFILE_BIT_ARB,
-            0,
-            0,
+        // Progressive OpenGL version upgrade for Linux (GLX)
+        // Try versions in order: requested -> 4.1 -> 4.0 -> 3.3 -> 3.2 -> 3.0 -> 2.1
+        let versions_to_try: Vec<(libc::c_int, libc::c_int)> = vec![
+            (opengl_version.major as libc::c_int, opengl_version.minor as libc::c_int),
+            (4, 1),
+            (4, 0),
+            (3, 3),
+            (3, 2),
+            (3, 0),
+            (2, 1),
         ];
-        let glx_ctx = self.extensions.glxCreateContextAttribsARB.unwrap()(
-            display.display,
-            self.fbconfig,
-            std::ptr::null_mut(),
-            true as _,
-            attribs.as_ptr(),
-        );
-        assert!(!glx_ctx.is_null(), "GLX: failed to create GL context");
+
+        let mut glx_ctx: GLXContext = std::ptr::null_mut();
+
+        for (major, minor) in versions_to_try {
+            println!("GLX: Trying to create OpenGL {}.{} context...", major, minor);
+
+            let attribs: [libc::c_int; 9] = [
+                GLX_CONTEXT_MAJOR_VERSION_ARB,
+                major,
+                GLX_CONTEXT_MINOR_VERSION_ARB,
+                minor,
+                GLX_CONTEXT_FLAGS_ARB,
+                GLX_CONTEXT_FORWARD_COMPATIBLE_BIT_ARB,
+                GLX_CONTEXT_PROFILE_MASK_ARB,
+                GLX_CONTEXT_CORE_PROFILE_BIT_ARB,
+                0,
+            ];
+
+            glx_ctx = self.extensions.glxCreateContextAttribsARB.unwrap()(
+                display.display,
+                self.fbconfig,
+                std::ptr::null_mut(),
+                true as _,
+                attribs.as_ptr(),
+            );
+
+            if !glx_ctx.is_null() {
+                println!("GLX: Successfully created OpenGL {}.{} context", major, minor);
+                break;
+            } else {
+                println!("GLX: Failed to create OpenGL {}.{} context", major, minor);
+            }
+        }
+
+        assert!(!glx_ctx.is_null(), "GLX: failed to create GL context with any version");
         // _sapp_x11_release_error_handler(libx11);
 
         let glx_window = self.libgl.glxCreateWindow.unwrap()(

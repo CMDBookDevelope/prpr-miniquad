@@ -370,6 +370,7 @@ impl Wgl {
         display: &mut Display,
         sample_count: i32,
         swap_interval: i32,
+        opengl_version: crate::conf::GlVersion,
     ) -> HGLRC {
         let pixel_format = self.wgl_find_pixel_format(display, sample_count);
         if 0 == pixel_format {
@@ -396,57 +397,64 @@ impl Wgl {
         //     panic!("WGL: ARB_create_context_profile required!");
         // }
 
-        // CreateContextAttribsARB is supposed to create the context with
-        // the highest version version possible
-        // but, somehow, sometimes, it creates 2.1 context when 3.2 is in fact available
-        // so this is a workaround: try to create 3.2, and if it fails, go for 2.1
-        let attrs = [
-            WGL_CONTEXT_MAJOR_VERSION_ARB,
-            3,
-            2,
-            WGL_CONTEXT_MINOR_VERSION_ARB,
-            3,
-            1,
-            WGL_CONTEXT_FLAGS_ARB,
-            WGL_CONTEXT_FORWARD_COMPATIBLE_BIT_ARB,
-            WGL_CONTEXT_PROFILE_MASK_ARB,
-            WGL_CONTEXT_CORE_PROFILE_BIT_ARB,
+        // Progressive OpenGL version upgrade with graceful degradation
+        // Try versions in order: requested -> 4.1 -> 4.0 -> 3.3 -> 3.2 -> 3.0 -> 2.1
+        let versions_to_try: Vec<(u32, u32)> = vec![
+            (opengl_version.major, opengl_version.minor),
+            (4, 1),
+            (4, 0),
+            (3, 3),
+            (3, 2),
+            (3, 0),
+            (2, 1),
         ];
-        let mut gl_ctx = self.CreateContextAttribsARB.unwrap()(
-            display.dc,
-            std::ptr::null_mut(),
-            attrs.as_ptr() as *const _,
-        );
 
-        if gl_ctx.is_null() {
-            println!("WGL: failed to create 3.2 context, trying 2.1");
+        let mut gl_ctx: HGLRC = std::ptr::null_mut();
+        let mut last_error = 0;
+
+        for (major, minor) in versions_to_try {
+            println!("WGL: Trying to create OpenGL {}.{} context...", major, minor);
 
             let attrs = [
                 WGL_CONTEXT_MAJOR_VERSION_ARB,
-                2,
+                major,
                 WGL_CONTEXT_MINOR_VERSION_ARB,
-                1,
+                minor,
                 WGL_CONTEXT_FLAGS_ARB,
+                WGL_CONTEXT_FORWARD_COMPATIBLE_BIT_ARB,
+                WGL_CONTEXT_PROFILE_MASK_ARB,
                 WGL_CONTEXT_CORE_PROFILE_BIT_ARB,
                 0,
-                0,
             ];
+
             gl_ctx = self.CreateContextAttribsARB.unwrap()(
                 display.dc,
                 std::ptr::null_mut(),
                 attrs.as_ptr() as *const _,
             );
+
+            if !gl_ctx.is_null() {
+                println!("WGL: Successfully created OpenGL {}.{} context", major, minor);
+                break;
+            } else {
+                last_error = GetLastError();
+                println!(
+                    "WGL: Failed to create OpenGL {}.{} context (error: 0x{:08X})",
+                    major, minor, last_error
+                );
+            }
         }
+
         if gl_ctx.is_null() {
-            let err = GetLastError();
+            let err = last_error;
             if err == (0xc0070000 | ERROR_INVALID_VERSION_ARB) {
-                panic!("WGL: Driver does not support OpenGL version 3.3");
+                panic!("WGL: Driver does not support any of the requested OpenGL versions");
             } else if err == (0xc0070000 | ERROR_INVALID_PROFILE_ARB) {
                 panic!("WGL: Driver does not support the requested OpenGL profile");
             } else if err == (0xc0070000 | ERROR_INCOMPATIBLE_DEVICE_CONTEXTS_ARB) {
                 panic!("WGL: The share context is not compatible with the requested context");
             } else {
-                panic!("WGL: Failed to create OpenGL context");
+                panic!("WGL: Failed to create OpenGL context with error: 0x{:08X}", err);
             }
         }
         (display.libopengl32.wglMakeCurrent)(display.dc, gl_ctx);

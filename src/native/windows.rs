@@ -916,6 +916,7 @@ where
             &mut display,
             conf.sample_count,
             conf.platform.swap_interval.unwrap_or(1),
+            conf.platform.opengl_version,
         );
 
         super::gl::load_gl_funcs(|proc| display.get_proc_address(proc));

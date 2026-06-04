@@ -697,7 +697,8 @@ where
     let depth = glx.depth;
     let window = display.create_window(visual, depth, conf);
     display.window = window;
-    let (glx_context, glx_window) = glx.create_context(&mut display, window);
+    let (glx_context, glx_window) =
+            glx.create_context(&mut display, window, conf.platform.opengl_version);
     glx.swap_interval(
         &mut display,
         glx_window,

@@ -34,8 +34,8 @@ impl RenderingBackendContext {
         match self {
             RenderingBackendContext::OpenGL(gl_ctx) => {
                 // Update GL context after OpenGL functions are loaded
-                let is_gles2 = unsafe { crate::native::gl::is_gl2() };
-                *gl_ctx = GraphicsContext::new(is_gles2);
+                //let is_gles2 = unsafe { crate::native::gl::is_gl2() };
+                //*gl_ctx = GraphicsContext::new(is_gles2);
                 Ok(())
             }
             #[cfg(feature = "vulkan")]

@@ -521,39 +521,97 @@ fn get_window_payload(this: &Object) -> &mut WindowPayload {
     }
 }
 
-unsafe fn create_opengl_view(window_frame: NSRect, sample_count: i32, high_dpi: bool) -> ObjcId {
+unsafe fn create_opengl_view(
+    window_frame: NSRect,
+    sample_count: i32,
+    high_dpi: bool,
+    opengl_version: crate::conf::GlVersion,
+) -> ObjcId {
     use NSOpenGLPixelFormatAttribute::*;
 
-    let mut attrs: Vec<u32> = vec![];
-
-    attrs.push(NSOpenGLPFAAccelerated as _);
-    attrs.push(NSOpenGLPFADoubleBuffer as _);
-    attrs.push(NSOpenGLPFAOpenGLProfile as _);
-    attrs.push(NSOpenGLPFAOpenGLProfiles::NSOpenGLProfileVersion3_2Core as _);
-    attrs.push(NSOpenGLPFAColorSize as _);
-    attrs.push(24);
-    attrs.push(NSOpenGLPFAAlphaSize as _);
-    attrs.push(8);
-    attrs.push(NSOpenGLPFADepthSize as _);
-    attrs.push(24);
-    attrs.push(NSOpenGLPFAStencilSize as _);
-    attrs.push(8);
-    if sample_count > 1 {
-        attrs.push(NSOpenGLPFAMultisample as _);
-        attrs.push(NSOpenGLPFASampleBuffers as _);
-        attrs.push(1 as _);
-        attrs.push(NSOpenGLPFASamples as _);
-        attrs.push(sample_count as _);
+    // Progressive OpenGL version upgrade for macOS
+    // macOS supports OpenGL up to 4.1, so we clamp the requested version to 4.1
+    // Try versions in order: clamped requested -> 4.1 -> 3.3 -> 3.2 -> legacy
+    let profiles_to_try: Vec<u32> = if opengl_version.major >= 4 && opengl_version.minor >= 1 {
+        vec![
+            NSOpenGLPFAOpenGLProfiles::NSOpenGLProfileVersion4_1Core as _,
+            NSOpenGLPFAOpenGLProfiles::NSOpenGLProfileVersion3_2Core as _,
+        ]
+    } else if opengl_version.major >= 3 && opengl_version.minor >= 2 {
+        vec![
+            NSOpenGLPFAOpenGLProfiles::NSOpenGLProfileVersion3_2Core as _,
+        ]
     } else {
-        attrs.push(NSOpenGLPFASampleBuffers as _);
-        attrs.push(0);
-    }
-    attrs.push(0);
+        vec![
+            NSOpenGLPFAOpenGLProfiles::NSOpenGLProfileVersion3_2Core as _,
+        ]
+    };
 
-    let glpixelformat_obj: ObjcId = msg_send![class!(NSOpenGLPixelFormat), alloc];
-    let glpixelformat_obj: ObjcId =
-        msg_send![glpixelformat_obj, initWithAttributes: attrs.as_ptr()];
-    assert!(!glpixelformat_obj.is_null());
+    let mut glpixelformat_obj: ObjcId = std::ptr::null_mut();
+
+    for profile in profiles_to_try {
+        println!(
+            "macOS: Trying OpenGL profile: {}",
+            if profile == NSOpenGLPFAOpenGLProfiles::NSOpenGLProfileVersion4_1Core as _ {
+                "4.1 Core"
+            } else {
+                "3.2 Core"
+            }
+        );
+
+        let mut attrs: Vec<u32> = vec![];
+
+        attrs.push(NSOpenGLPFAAccelerated as _);
+        attrs.push(NSOpenGLPFADoubleBuffer as _);
+        attrs.push(NSOpenGLPFAOpenGLProfile as _);
+        attrs.push(profile);
+        attrs.push(NSOpenGLPFAColorSize as _);
+        attrs.push(24);
+        attrs.push(NSOpenGLPFAAlphaSize as _);
+        attrs.push(8);
+        attrs.push(NSOpenGLPFADepthSize as _);
+        attrs.push(24);
+        attrs.push(NSOpenGLPFAStencilSize as _);
+        attrs.push(8);
+        if sample_count > 1 {
+            attrs.push(NSOpenGLPFAMultisample as _);
+            attrs.push(NSOpenGLPFASampleBuffers as _);
+            attrs.push(1 as _);
+            attrs.push(NSOpenGLPFASamples as _);
+            attrs.push(sample_count as _);
+        } else {
+            attrs.push(NSOpenGLPFASampleBuffers as _);
+            attrs.push(0);
+        }
+        attrs.push(0);
+
+        glpixelformat_obj = msg_send![class!(NSOpenGLPixelFormat), alloc];
+        glpixelformat_obj = msg_send![glpixelformat_obj, initWithAttributes: attrs.as_ptr()];
+
+        if !glpixelformat_obj.is_null() {
+            println!(
+                "macOS: Successfully created OpenGL context with profile: {}",
+                if profile == NSOpenGLPFAOpenGLProfiles::NSOpenGLProfileVersion4_1Core as _ {
+                    "4.1 Core"
+                } else {
+                    "3.2 Core"
+                }
+            );
+            break;
+        } else {
+            println!("macOS: Failed to create OpenGL context with profile: {}",
+                if profile == NSOpenGLPFAOpenGLProfiles::NSOpenGLProfileVersion4_1Core as _ {
+                    "4.1 Core"
+                } else {
+                    "3.2 Core"
+                }
+            );
+        }
+    }
+
+    if glpixelformat_obj.is_null() {
+        panic!("macOS: Failed to create OpenGL context with any profile");
+    }
 
     let view_class = define_cocoa_view_class();
     let view: ObjcId = msg_send![view_class, alloc];
@@ -642,7 +700,12 @@ where
     let () = msg_send![window, center];
     let () = msg_send![window, setAcceptsMouseMovedEvents: YES];
 
-    let view = create_opengl_view(window_frame, conf.sample_count, conf.high_dpi);
+    let view = create_opengl_view(
+        window_frame,
+        conf.sample_count,
+        conf.high_dpi,
+        conf.platform.opengl_version,
+    );
     (*view).set_ivar("display_ptr", &mut payload as *mut _ as *mut c_void);
 
     payload.display.window = window;

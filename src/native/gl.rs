@@ -26,6 +26,12 @@ pub type GLclampf = f32;
 pub type GLdouble = f64;
 pub type GLclampd = f64;
 
+#[repr(C)]
+pub struct __GLsync {
+    _unused: [u8; 0],
+}
+pub type GLsync = *mut __GLsync;
+
 pub const GL_INT_2_10_10_10_REV: u32 = 0x8D9F;
 pub const GL_PROGRAM_POINT_SIZE: u32 = 0x8642;
 pub const GL_STENCIL_ATTACHMENT: u32 = 0x8D20;
@@ -70,6 +76,15 @@ pub const GL_UNSIGNED_SHORT_4_4_4_4: u32 = 0x8033;
 pub const GL_SRC_ALPHA_SATURATE: u32 = 0x0308;
 pub const GL_STREAM_DRAW: u32 = 0x88E0;
 pub const GL_STREAM_READ: u32 = 0x88E1;
+pub const GL_DYNAMIC_READ: u32 = 0x88E9;
+pub const GL_MAP_READ_BIT: u32 = 0x0001;
+pub const GL_MAP_UNSYNCHRONIZED_BIT: u32 = 0x0020;
+pub const GL_SYNC_FLUSH_COMMANDS_BIT: u32 = 0x00000001;
+pub const GL_SYNC_GPU_COMMANDS_COMPLETE: u32 = 0x9117;
+pub const GL_ALREADY_SIGNALED: u32 = 0x911A;
+pub const GL_CONDITION_SATISFIED: u32 = 0x911C;
+pub const GL_WAIT_FAILED: u32 = 0x911D;
+pub const GL_TIMEOUT_EXPIRED: u32 = 0x911B;
 pub const GL_ONE: u32 = 1;
 pub const GL_NEAREST_MIPMAP_LINEAR: u32 = 0x2702;
 pub const GL_RGB10_A2: u32 = 0x8059;
@@ -629,7 +644,11 @@ gl_loader!(
     fn glFlush() -> (),
     fn glFinish() -> (),
     fn glMapBuffer(target: GLenum, access: GLenum) -> *const GLubyte,
-    fn glUnmapBuffer(target: GLenum) -> ()
+    fn glMapBufferRange(target: GLenum, offset: GLintptr, length: GLsizeiptr, access: GLbitfield) -> *mut GLvoid,
+    fn glUnmapBuffer(target: GLenum) -> GLboolean,
+    fn glFenceSync(condition: GLenum, flags: GLbitfield) -> GLsync,
+    fn glClientWaitSync(sync: GLsync, flags: GLbitfield, timeout: GLuint64) -> GLenum,
+    fn glDeleteSync(sync: GLsync) -> ()
 );
 
 // note that glGetString only works after first glSwapBuffer,

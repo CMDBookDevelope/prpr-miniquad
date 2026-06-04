@@ -77,6 +77,64 @@ impl Default for RenderingBackend {
     }
 }
 
+/// OpenGL version configuration for context creation
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GlVersion {
+    /// Major version (e.g., 4 for OpenGL 4.6)
+    pub major: u32,
+    /// Minor version (e.g., 6 for OpenGL 4.6)
+    pub minor: u32,
+}
+
+impl GlVersion {
+    /// Create a new OpenGL version
+    pub const fn new(major: u32, minor: u32) -> Self {
+        GlVersion { major, minor }
+    }
+
+    /// OpenGL 4.1 - maximum version supported on macOS
+    pub const fn gl_4_1() -> Self {
+        GlVersion { major: 4, minor: 1 }
+    }
+
+    /// OpenGL 4.6 - maximum version on modern Windows/Linux
+    pub const fn gl_4_6() -> Self {
+        GlVersion { major: 4, minor: 6 }
+    }
+
+    /// OpenGL 4.0 - modern features with wider hardware support
+    pub const fn gl_4_0() -> Self {
+        GlVersion { major: 4, minor: 0 }
+    }
+
+    /// OpenGL 3.3 - widely supported minimum for modern features
+    pub const fn gl_3_3() -> Self {
+        GlVersion { major: 3, minor: 3 }
+    }
+
+    /// OpenGL 3.2 - core profile, good compatibility
+    pub const fn gl_3_2() -> Self {
+        GlVersion { major: 3, minor: 2 }
+    }
+
+    /// OpenGL 3.0 - older hardware support
+    pub const fn gl_3_0() -> Self {
+        GlVersion { major: 3, minor: 0 }
+    }
+
+    /// OpenGL 2.1 - legacy version for very old hardware
+    pub const fn gl_2_1() -> Self {
+        GlVersion { major: 2, minor: 1 }
+    }
+}
+
+impl Default for GlVersion {
+    fn default() -> Self {
+        // Default to 4.1 for cross-platform compatibility (max on macOS)
+        GlVersion::gl_4_1()
+    }
+}
+
 /// Platform specific settings.
 #[derive(Debug)]
 pub struct Platform {
@@ -111,6 +169,12 @@ pub struct Platform {
 
     /// Rendering backend selection
     pub rendering_backend: RenderingBackend,
+
+    /// Desired OpenGL version.
+    /// The system will try to create a context with this version and fall back to
+    /// lower versions if not available (following a graceful degradation path).
+    /// Default: 4.1 (max version supported on macOS, widely available on Windows/Linux)
+    pub opengl_version: GlVersion,
 }
 
 /// Multisample anti-aliasing configuration
@@ -138,6 +202,7 @@ impl Default for Platform {
             framebuffer_alpha: false,
             rendering_backend: RenderingBackend::OpenGL,
             multisample_antialiasing: MultisampleConfig::default(),
+            opengl_version: GlVersion::default(),
         }
     }
 }
