@@ -12,6 +12,7 @@ use crate::{
 
 use std::os::raw::c_void;
 use std::convert::TryInto;
+use std::ffi::CString;
 
 /// Internal display state for headless mode.
 pub struct HeadlessDisplay {
@@ -72,21 +73,25 @@ unsafe fn create_pbuffer_context(
     height: i32,
     alpha: bool,
 ) -> Result<(egl::EGLContext, egl::EGLConfig, egl::EGLDisplay, egl::EGLSurface), String> {
-    let display = (egl.eglGetDisplay.unwrap())(egl::EGL_DEFAULT_DISPLAY);  // 直接传，无需 as
+    // 直接使用 eglGetDisplay，依赖 EGL_PLATFORM 环境变量
+    let display = (egl.eglGetDisplay.unwrap())(egl::EGL_DEFAULT_DISPLAY);
     if display.is_null() {
+        if let Some(get_error) = egl.eglGetError {
+            let err = get_error();
+            eprintln!("eglGetDisplay failed, error: 0x{:x}", err);
+        }
         return Err("eglGetDisplay failed".to_string());
     }
 
     if (egl.eglInitialize.unwrap())(display, std::ptr::null_mut(), std::ptr::null_mut()) == 0 {
-        return Err("eglInitialize failed".to_string());
+        let err = (egl.eglGetError.unwrap())();
+        return Err(format!("eglInitialize failed, error: 0x{:x}", err));
     }
 
+    // 4. 配置属性
     let alpha_size = if alpha { 8 } else { 0 };
-
-    // 使用 Vec<i32> 方便追加 EGL_NONE
     let cfg_attributes = vec![
-        egl::EGL_SURFACE_TYPE as i32,
-        egl::EGL_PBUFFER_BIT as i32,
+        egl::EGL_SURFACE_TYPE as i32, egl::EGL_PBUFFER_BIT as i32,
         egl::EGL_RED_SIZE as i32, 8,
         egl::EGL_GREEN_SIZE as i32, 8,
         egl::EGL_BLUE_SIZE as i32, 8,
@@ -110,15 +115,12 @@ unsafe fn create_pbuffer_context(
     if num_configs == 0 {
         return Err("No suitable EGL config found".to_string());
     }
-
     let config = configs[0];
 
-    // Pbuffer 属性也使用 i32
+    // 5. 创建 Pbuffer 表面
     let pbuffer_attrs = [
-        egl::EGL_WIDTH as i32,
-        width,
-        egl::EGL_HEIGHT as i32,
-        height,
+        egl::EGL_WIDTH as i32, width,
+        egl::EGL_HEIGHT as i32, height,
         egl::EGL_NONE as i32,
     ];
     let surface = (egl.eglCreatePbufferSurface.unwrap())(
@@ -130,10 +132,9 @@ unsafe fn create_pbuffer_context(
         return Err("eglCreatePbufferSurface failed".to_string());
     }
 
-    // Context 属性
+    // 6. 创建上下文
     let ctx_attrs = [
-        egl::EGL_CONTEXT_CLIENT_VERSION as i32,
-        2,
+        egl::EGL_CONTEXT_CLIENT_VERSION as i32, 2,
         egl::EGL_NONE as i32,
     ];
     let context = (egl.eglCreateContext.unwrap())(
@@ -146,6 +147,7 @@ unsafe fn create_pbuffer_context(
         return Err("eglCreateContext failed".to_string());
     }
 
+    // 7. 激活上下文
     if (egl.eglMakeCurrent.unwrap())(display, surface, surface, context) == 0 {
         return Err("eglMakeCurrent failed".to_string());
     }
