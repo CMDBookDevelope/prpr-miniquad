@@ -215,12 +215,17 @@ where
     {
         let mut f = Some(f);
         let f = &mut f;
+        #[cfg(feature = "headless")]
+        {
+            native::headless::run(&conf, f).expect("Headless backend failed");
+            return;
+        }
         match conf.platform.linux_backend {
             conf::LinuxBackend::X11Only => {
-                native::linux_x11::run(&conf, f).expect("X11 backend failed")
+                native::linux_x11::run(&conf, f).expect("X11 backend failed");
             }
             conf::LinuxBackend::WaylandOnly => {
-                native::linux_wayland::run(&conf, f).expect("Wayland backend failed")
+                native::linux_wayland::run(&conf, f).expect("Wayland backend failed");
             }
             conf::LinuxBackend::X11WithWaylandFallback => {
                 if native::linux_x11::run(&conf, f).is_none() {
