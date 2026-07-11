@@ -18,6 +18,7 @@ categories = ["rendering::graphics-api"]
 # Optional log-rs like macros implementation
 # disabled by default
 log-impl = []
+headless = []
 
 # Vulkan backend support
 vulkan = ["ash", "ash-window", "gpu-allocator", "shaderc", "rayon"]
