@@ -93,6 +93,12 @@ pub mod ios;
 #[cfg(any(target_os = "android", target_os = "linux"))]
 pub mod egl;
 
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub mod headless;
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub use headless::*;
+
 // there is no glGetProcAddr on webgl, so its impossible to make "gl" module work
 // on macos.. well, there is, but way easier to just statically link to gl
 #[cfg(not(any(target_arch = "wasm32", target_os = "macos", target_os = "ios")))]
