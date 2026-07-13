@@ -203,11 +203,20 @@ where
 }
 
 /// Start miniquad.
-/*pub fn start<F>(conf: conf::Conf, f: F)
+pub fn start<F>(conf: conf::Conf, f: F)
 where
     F: 'static + FnOnce(&mut Context) -> Box<dyn EventHandler>,
 {
-    #[cfg(target_env = "ohos")]
+    //Only headless(Force)
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    {
+        let mut f = Some(f);
+        let f = &mut f;
+        native::headless::run(&conf, f).expect("Headless backend failed");
+        return;
+    }
+}
+    /*#[cfg(target_env = "ohos")]
     unsafe {
         native::ohos::run(conf, f);
     }
@@ -267,15 +276,6 @@ where
         native::ios::run(conf, f);
     }
 }*/
-
-//Only headless(Force)
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-{
-    let mut f = Some(f);
-    let f = &mut f;
-    native::headless::run(&conf, f).expect("Headless backend failed");
-    return;
-}
 
 #[cfg(target_env = "ohos")]
 extern "C" {
