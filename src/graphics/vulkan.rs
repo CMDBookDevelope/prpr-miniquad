@@ -16,8 +16,10 @@ use crate::graphics::*;
 
 mod frame;
 mod resource;
+mod recording;
 
 pub use resource::*;
+pub use recording::CommandRecordingStats;
 
 pub const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
@@ -120,6 +122,7 @@ pub struct VulkanContext {
 
     pub command_pool: vk::CommandPool,
     pub command_buffers: Vec<vk::CommandBuffer>,
+    pub(crate) recorder: recording::CommandRecorder,
 
     /// `image_available` is handed out round-robin because
 /// `acquire_next_image` has to name the wait semaphore before the image index
@@ -472,6 +475,7 @@ impl VulkanContext {
                 .create_fence(&vk::FenceCreateInfo::default(), None)
                 .expect("Failed to create the readback fence");
 
+            let recorder = recording::CommandRecorder::new(&device, queue_family_index);
             let mut context = VulkanContext {
                 entry,
                 instance,
@@ -495,6 +499,7 @@ impl VulkanContext {
 
                 command_pool,
                 command_buffers: Vec::new(),
+                recorder,
 
                 image_available: Vec::new(),
                 render_finished: Vec::new(),
@@ -636,6 +641,7 @@ impl VulkanContext {
     pub fn cleanup(&mut self) {
         unsafe {
             self.device.device_wait_idle().unwrap();
+            self.recorder.destroy(&self.device);
 
             let passes = std::mem::take(&mut self.passes);
             for pass in passes.iter().flatten() {
@@ -1105,6 +1111,7 @@ impl VulkanContext {
     /// Descriptor sets stay referenced by the command buffers they are bound
     /// in, so this may only run once the frame fence has been waited on.
     pub(crate) fn free_allocated_sets(&mut self) {
+        self.recorder.reset(&self.device, self.current_frame);
         unsafe {
             self.device
                 .reset_descriptor_pool(
@@ -1113,6 +1120,10 @@ impl VulkanContext {
                 )
                 .expect("Failed to reset the descriptor pool");
         }
+    }
+
+    pub fn command_recording_stats(&self) -> CommandRecordingStats {
+        self.recorder.stats()
     }
 }
 

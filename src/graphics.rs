@@ -1143,6 +1143,13 @@ impl Context {
         }
     }
 
+    pub fn flush_draw_commands(&mut self) {
+        #[cfg(feature = "vulkan")]
+        if let GraphicsBackend::Vulkan(ctx) = &mut self.backend {
+            ctx.flush_draw_commands();
+        }
+    }
+
     /// Copy the colour of one render target into another, scaling to fit.
     pub fn copy_render_target(&mut self, src: RenderPass, dst: RenderPass) {
         match &mut self.backend {

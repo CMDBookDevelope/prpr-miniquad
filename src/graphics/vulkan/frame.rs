@@ -1,4 +1,4 @@
-use std::ptr;use ash::vk;use ash::vk::Handle;use crate::graphics::*;
+use std::{convert::TryFrom, ptr};use ash::vk;use ash::vk::Handle;use crate::graphics::*;
 use super::resource::vk_index_type;
 use super::{VulkanContext, DEPTH_FORMAT, IMAGE_BINDING_BASE, MAX_FRAMES_IN_FLIGHT, UNIFORM_BINDING};
 
@@ -88,6 +88,7 @@ impl VulkanContext {
         }
         let image_index = self.acquired_image.unwrap();
         self.close_pass();
+        self.flush_draw_commands();
         let command_buffer = self.command_buffers[image_index];
         unsafe {
             self.device
@@ -199,6 +200,7 @@ impl VulkanContext {
                     Err(error) => panic!("Failed to acquire a swapchain image: {:?}", error),
                 }
             };
+
             let image_index = image_index as usize;
             self.swapchain_suboptimal = suboptimal;
 
@@ -250,6 +252,7 @@ impl VulkanContext {
             self.device.device_wait_idle().unwrap();
             if self.pass_open && self.acquired_image.is_some() {
                 self.close_pass();
+                self.flush_draw_commands();
             }
             for command_buffer in &self.command_buffers {
                 let _ = self.device.reset_command_buffer(
@@ -373,6 +376,7 @@ impl VulkanContext {
         // instance.
         self.close_pass();
         let command_buffer = self.command_buffers[self.acquired_image.unwrap()];
+        self.flush_draw_commands();
         unsafe {
             let nv12 = vk::Image::from_raw(nv12_image_raw);
             let staging = vk::Buffer::from_raw(staging_buffer_raw);
@@ -596,6 +600,7 @@ impl VulkanContext {
         );
         self.close_pass();
         let command_buffer = self.command_buffers[self.acquired_image.unwrap()];
+        self.flush_draw_commands();
         unsafe {
             let staging = vk::Buffer::from_raw(staging_buffer_raw);
             let y = self.textures[y_index].image;
@@ -704,6 +709,7 @@ impl VulkanContext {
             return;
         }
         self.close_pass();
+        self.flush_draw_commands();
         let slot = self.acquired_image.take().unwrap();
         let command_buffer = self.command_buffers[slot];
         unsafe {
@@ -897,11 +903,15 @@ impl VulkanContext {
             ..Default::default()
         };
 
-        unsafe {
-            self.device.cmd_begin_rendering(
-                self.command_buffers[self.acquired_image.unwrap()],
-                &rendering_info,
-            );
+        if self.recorder.enabled() {
+            self.recorder.begin(area, color_attachments[0], if has_depth { Some(depth_attachments[0]) } else { None });
+        } else {
+            unsafe {
+                self.device.cmd_begin_rendering(
+                    self.command_buffers[self.acquired_image.unwrap()],
+                    &rendering_info,
+                );
+            }
         }
 
         self.pass_open = true;
@@ -920,13 +930,43 @@ impl VulkanContext {
         if !self.pass_open {
             return;
         }
-        unsafe {
-            self.device
-                .cmd_end_rendering(self.command_buffers[self.acquired_image.unwrap()]);
+        if self.recorder.enabled() {
+            self.recorder.batch(self.cur_color_format, self.cur_depth_format, self.cur_samples);
+            self.recorder.end();
+        } else {
+            unsafe {
+                self.device
+                    .cmd_end_rendering(self.command_buffers[self.acquired_image.unwrap()]);
+            }
         }
         self.pass_open = false;
         self.cur_pass = None;
         self.cmd_dirty = true;
+    }
+
+    pub fn flush_draw_commands(&mut self) {
+        if self.recorder.enabled() && self.frame_active {
+            if self.pass_open {
+                self.recorder.batch(self.cur_color_format, self.cur_depth_format, self.cur_samples);
+            }
+            self.recorder.execute(&self.device, self.command_buffers[self.acquired_image.unwrap()], self.current_frame);
+        }
+    }
+
+    fn pass_image_barrier(
+        &mut self,
+        command: vk::CommandBuffer,
+        src: vk::PipelineStageFlags,
+        dst: vk::PipelineStageFlags,
+        image: vk::ImageMemoryBarrier,
+    ) {
+        if self.recorder.enabled() {
+            self.recorder.barrier(src, dst, image);
+        } else {
+            unsafe {
+                self.device.cmd_pipeline_barrier(command, src, dst, vk::DependencyFlags::empty(), &[], &[], &[image]);
+            }
+        }
     }
 
     /// `vkCmdBeginRendering` has no `initialLayout` to transition from, so the
@@ -959,17 +999,7 @@ impl VulkanContext {
                 layer_count: 1,
             })
             .build();
-        unsafe {
-            self.device.cmd_pipeline_barrier(
-                command_buffer,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[barrier],
-            );
-        }
+        self.pass_image_barrier(command_buffer, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT, barrier);
         self.swapchain_image_layouts[index] = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
     }
 
@@ -1011,17 +1041,7 @@ impl VulkanContext {
                     layer_count: 1,
                 })
                 .build();
-            unsafe {
-                self.device.cmd_pipeline_barrier(
-                    command_buffer,
-                    src_stage,
-                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[barrier],
-                );
-            }
+            self.pass_image_barrier(command_buffer, src_stage, vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT, barrier);
             self.textures[index].layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
         }
     }
@@ -1174,17 +1194,7 @@ impl VulkanContext {
                     layer_count: 1,
                 })
                 .build();
-            unsafe {
-                self.device.cmd_pipeline_barrier(
-                    command_buffer,
-                    src_stage,
-                    vk::PipelineStageFlags::FRAGMENT_SHADER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[barrier],
-                );
-            }
+            self.pass_image_barrier(command_buffer, src_stage, vk::PipelineStageFlags::FRAGMENT_SHADER, barrier);
             self.textures[index].layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
         }
     }
@@ -1313,6 +1323,51 @@ impl VulkanContext {
             }
             None => None,
         };
+
+        if self.recorder.enabled() {
+            let shader = &self.shaders[shader_index];
+            let dummy = &self.textures[self.dummy_texture];
+            let dummy_info = vk::DescriptorImageInfo {
+                sampler: dummy.sampler,
+                image_view: dummy.sample_view.unwrap_or(dummy.view),
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            };
+            let index = &self.buffers[index_buffer];
+            let index_type = index.index_type.expect("Unset index buffer type");
+            let height = self.viewport.extent.height as f32;
+            let screen = self.cur_target.is_none();
+            let vertex_buffers = self.cur_vertex_buffers.iter().map(|slot| self.buffers[slot.expect("Unbound vertex buffer")].current_buffer).collect();
+            let vertex_offsets = self.cur_vertex_buffers.iter().map(|slot| self.buffers[slot.expect("Unbound vertex buffer")].current_offset).collect();
+            self.recorder.draws.push(super::recording::RecordedDraw {
+                pipeline: vk_pipeline,
+                pipeline_layout: shader.pipeline_layout,
+                descriptor_layout: shader_layout,
+                uniform: if uniforms_size > 0 { Some(vk::DescriptorBufferInfo {
+                    buffer: self.uniform_arenas[self.current_frame].buffer, offset: 0, range: uniforms_size,
+                }) } else { None },
+                uniform_offset: uniform_offset.map(|offset| u32::try_from(offset).expect("Uniform offset exceeds u32")),
+                images: (0..images).map(|slot| self.pending.images[slot].unwrap_or(dummy_info)).collect(),
+                viewport: vk::Viewport {
+                    x: self.viewport.offset.x as f32,
+                    y: self.viewport.offset.y as f32 + if screen { height } else { 0. },
+                    width: self.viewport.extent.width as f32,
+                    height: if screen { -height } else { height },
+                    min_depth: 0., max_depth: 1.,
+                },
+                scissor: self.scissor,
+                index_buffer: index.current_buffer,
+                index_offset: index.current_offset,
+                index_type: vk_index_type(index_type),
+                vertex_buffers,
+                vertex_offsets,
+                first_index: (index_type.size() as i32 * base_element) as u32,
+                index_count: num_elements as u32,
+                instance_count: num_instances as u32,
+            });
+            self.cmd_dirty = true;
+            self.pending.uniform_offset = None;
+            return;
+        }
 
         // Flush the pending descriptor writes into a set for this draw.
         let descriptor_set = self.allocate_descriptor_set(shader_layout);
@@ -1452,7 +1507,7 @@ impl VulkanContext {
             return;
         }
         self.close_pass();
-
+        self.flush_draw_commands();
         let image_index = self.acquired_image.take().unwrap();
         let command_buffer = self.command_buffers[image_index];
         let wait = self.frame_wait;
