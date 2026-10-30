@@ -998,9 +998,16 @@ impl Context {
     }
 
     #[cfg(feature = "vulkan")]
+    /// Borrow the raw backend after its submission thread has released host
+    /// ownership of the graphics queue. This does not wait for GPU completion.
+    /// Queue access is exclusive for this borrow; callers that retain raw
+    /// handles beyond it must coordinate later access with the renderer.
     pub fn vulkan_context(&mut self) -> Option<&mut vulkan::VulkanContext> {
         match &mut self.backend {
-            GraphicsBackend::Vulkan(ctx) => Some(ctx),
+            GraphicsBackend::Vulkan(ctx) => {
+                ctx.drain_submissions();
+                Some(ctx)
+            }
             GraphicsBackend::OpenGL(_) => None,
         }
     }

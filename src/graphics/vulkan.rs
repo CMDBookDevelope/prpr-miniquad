@@ -17,6 +17,7 @@ use crate::graphics::*;
 mod frame;
 mod resource;
 mod recording;
+mod submission;
 
 pub use resource::*;
 pub use recording::CommandRecordingStats;
@@ -123,6 +124,10 @@ pub struct VulkanContext {
     pub command_pool: vk::CommandPool,
     pub command_buffers: Vec<vk::CommandBuffer>,
     pub(crate) recorder: recording::CommandRecorder,
+    /// Only this worker accesses the graphics queue between a frame handoff
+    /// and `drain_submissions`. Synchronous resource operations drain first.
+    submission: Option<submission::SubmissionWorker>,
+    presentation_needs_recreate: bool,
 
     /// `image_available` is handed out round-robin because
 /// `acquire_next_image` has to name the wait semaphore before the image index
@@ -476,6 +481,7 @@ impl VulkanContext {
                 .expect("Failed to create the readback fence");
 
             let recorder = recording::CommandRecorder::new(&device, queue_family_index);
+            let submission = submission::SubmissionWorker::new(&device, &swapchain_loader, graphics_queue);
             let mut context = VulkanContext {
                 entry,
                 instance,
@@ -500,6 +506,8 @@ impl VulkanContext {
                 command_pool,
                 command_buffers: Vec::new(),
                 recorder,
+                submission,
+                presentation_needs_recreate: false,
 
                 image_available: Vec::new(),
                 render_finished: Vec::new(),
@@ -639,8 +647,15 @@ impl VulkanContext {
     }
 
     pub fn cleanup(&mut self) {
+        self.drain_submissions();
+        // Join before destroying any handle the worker's device references.
+        self.submission.take();
         unsafe {
             self.device.device_wait_idle().unwrap();
+            self.frame_active = false;
+            self.recording = false;
+            self.pass_open = false;
+            self.frame_submitted = false;
             self.recorder.destroy(&self.device);
 
             let passes = std::mem::take(&mut self.passes);
@@ -731,6 +746,9 @@ impl VulkanContext {
 
     /// (Re)create the swap chain and everything derived from it.
     fn create_swapchain(&mut self, window_size: (u32, u32)) {
+        self.drain_submissions();
+        self.presentation_needs_recreate = false;
+        self.swapchain_suboptimal = false;
         unsafe {
             self.device.device_wait_idle().unwrap();
             self.window_size = window_size;
@@ -917,6 +935,7 @@ impl VulkanContext {
         uv_index: usize,
         nv12_raw: u64,
     ) -> vk::ImageLayout {
+        self.drain_submissions();
         self.flush_recording();
         unsafe {
             let nv12 = vk::Image::from_raw(nv12_raw);
@@ -1124,6 +1143,20 @@ impl VulkanContext {
 
     pub fn command_recording_stats(&self) -> CommandRecordingStats {
         self.recorder.stats()
+    }
+
+    /// Reclaim host queue and swapchain access from the submission worker.
+    ///
+    /// Returning from the worker guarantees its `vkQueueSubmit`,
+    /// `vkQueuePresentKHR` and swapchain host calls are finished, so the
+    /// calling thread may touch the queue or swapchain (acquire, recreate,
+    /// synchronous transfers) without racing them. GPU completion remains the
+    /// caller's responsibility.
+    pub(crate) fn drain_submissions(&mut self) {
+        if let Some(worker) = &mut self.submission {
+            self.presentation_needs_recreate |= worker.drain()
+                .expect("Failed to submit or present the frame");
+        }
     }
 }
 

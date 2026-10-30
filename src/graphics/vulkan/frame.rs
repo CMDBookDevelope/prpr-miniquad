@@ -37,6 +37,7 @@ impl VulkanContext {
     where
         F: FnOnce(&VulkanContext, vk::CommandBuffer),
     {
+        self.drain_submissions();
         self.flush_recording();
         unsafe {
             let allocate_info = vk::CommandBufferAllocateInfo::builder()
@@ -86,6 +87,7 @@ impl VulkanContext {
         if !self.recording || !self.frame_active || !self.cmd_dirty {
             return false;
         }
+        self.drain_submissions();
         let image_index = self.acquired_image.unwrap();
         self.close_pass();
         self.flush_draw_commands();
@@ -121,7 +123,7 @@ impl VulkanContext {
     /// Release the per-frame pools and start recording again, after the GPU has
     /// finished the submission `flush_recording` made.
     pub(crate) fn release_frame_resources(&mut self) {
-        if !self.frame_submitted {
+        if !self.frame_submitted || !self.frame_active {
             return;
         }
         let image_index = self.acquired_image.unwrap();
@@ -156,6 +158,10 @@ impl VulkanContext {
     }
 
     fn begin_frame(&mut self) {
+        if self.presentation_needs_recreate {
+            self.drain_submissions();
+            self.recreate_swapchain();
+        }
         unsafe {
             let fence = self.in_flight[self.current_frame];
             let wait_start = std::time::Instant::now();
@@ -181,12 +187,8 @@ impl VulkanContext {
             }
             self.stream_arenas[slot].offset = 0;
 
-            self.device
-                .reset_fences(&[fence])
-                .expect("Failed to reset the frame fence");
             let (image_index, slot, suboptimal) = loop {
                 let slot = self.acquire_slot;
-                self.frame_wait = self.image_available[slot];
                 match self.swapchain_loader.acquire_next_image(
                     self.swapchain,
                     std::u64::MAX,
@@ -201,9 +203,15 @@ impl VulkanContext {
                 }
             };
 
+            // Reset only once an image was acquired and a submission will use
+            // this fence; the slot stays idle otherwise.
+            self.device
+                .reset_fences(&[fence])
+                .expect("Failed to reset the frame fence");
             let image_index = image_index as usize;
             self.swapchain_suboptimal = suboptimal;
 
+            self.frame_wait = self.image_available[slot];
             self.acquire_slot = (slot + 1) % self.image_available.len();
             self.acquired_image = Some(image_index);
             // The presentation engine owned the image until now, so whatever it
@@ -248,6 +256,10 @@ impl VulkanContext {
         if self.offscreen {
             return;
         }
+        self.drain_submissions();
+        // Exporters also use the public graphics queue for conversion and
+        // readback. Offscreen mode returns its ownership to the caller.
+        self.submission.take();
         let command_buffers = unsafe {
             self.device.device_wait_idle().unwrap();
             if self.pass_open && self.acquired_image.is_some() {
@@ -708,6 +720,7 @@ impl VulkanContext {
         if !self.frame_active {
             return;
         }
+        self.drain_submissions();
         self.close_pass();
         self.flush_draw_commands();
         let slot = self.acquired_image.take().unwrap();
@@ -1510,13 +1523,8 @@ impl VulkanContext {
         self.flush_draw_commands();
         let image_index = self.acquired_image.take().unwrap();
         let command_buffer = self.command_buffers[image_index];
-        let wait = self.frame_wait;
-        let signal = self.render_finished[image_index];
-        let fence = self.in_flight[self.current_frame];
-        let wait_mask = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
         let swapchain_image = self.swapchain_images[image_index];
         let swapchain_layout = self.swapchain_image_layouts[image_index];
-        let mut recreate = false;
 
         unsafe {
             // Hand the rendered image over to the presentation engine.
@@ -1549,64 +1557,33 @@ impl VulkanContext {
             self.device
                 .end_command_buffer(command_buffer)
                 .expect("Failed to end the command buffer");
-
-            let wait_semaphores = [wait];
-            let command_buffers = [command_buffer];
-            let signal_semaphores = [signal];
-            let submit_info = if self.frame_wait_pending {
-                vk::SubmitInfo::builder()
-                    .wait_semaphores(&wait_semaphores)
-                    .wait_dst_stage_mask(&wait_mask)
-                    .command_buffers(&command_buffers)
-                    .signal_semaphores(&signal_semaphores)
-                    .build()
-            } else {
-                vk::SubmitInfo::builder()
-                    .command_buffers(&command_buffers)
-                    .signal_semaphores(&signal_semaphores)
-                    .build()
-            };
-            self.device
-                .queue_submit(self.graphics_queue, &[submit_info], fence)
-                .expect("Failed to submit the frame");
-            self.frame_wait_pending = false;
-
-            let image_indices = [image_index as u32];
-            let swapchains = [self.swapchain];
-            let wait_for_present = [signal];
-            let present_info = vk::PresentInfoKHR::builder()
-                .wait_semaphores(&wait_for_present)
-                .swapchains(&swapchains)
-                .image_indices(&image_indices);
-            match self
-                .swapchain_loader
-                .queue_present(self.present_queue, &present_info.build())
-            {
-                Ok(_) => {
-                    self.swapchain_image_layouts[image_index] =
-                        vk::ImageLayout::PRESENT_SRC_KHR;
-                    if self.swapchain_suboptimal {
-                        self.swapchain_suboptimal = false;
-                        recreate = true;
-                    }
-                }
-                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) | Err(vk::Result::SUBOPTIMAL_KHR) => {
-                    recreate = true;
-                }
-                Err(error) => panic!("Failed to present the frame: {:?}", error),
-            }
-
-            self.current_frame = (self.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
         }
 
+        let submission = super::submission::FrameSubmission {
+            slot: self.current_frame,
+            command_buffer,
+            wait: self.frame_wait_pending.then_some(self.frame_wait),
+            signal: self.render_finished[image_index],
+            fence: self.in_flight[self.current_frame],
+            swapchain: self.swapchain,
+            image_index: image_index as u32,
+        };
+        if let Some(worker) = &mut self.submission {
+            worker.submit(submission);
+        } else {
+            self.presentation_needs_recreate |= submission
+                .execute(&self.device, &self.swapchain_loader, self.graphics_queue)
+                .expect("Failed to submit or present the frame");
+        }
+        self.presentation_needs_recreate |= self.swapchain_suboptimal;
+        self.swapchain_suboptimal = false;
+        self.swapchain_image_layouts[image_index] = vk::ImageLayout::PRESENT_SRC_KHR;
+        self.frame_wait_pending = false;
+        self.current_frame = (self.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
         self.recording = false;
         self.frame_active = false;
-        // Rebuilding the swap chain frees the command buffers and image views this
-        // frame used, so it waits until the frame is closed. The textures it creates
-        // transition their layout on their own, which would otherwise flush a frame
-        // `present` has already taken the image from.
-        if recreate {
-            self.recreate_swapchain();
-        }
+        // Host completion is consumed at the next use of this frame slot.
+        // Rebuilding a suboptimal swapchain is deferred to begin_frame, where
+        // the presentation worker is drained before swapchain handles change.
     }
 }
