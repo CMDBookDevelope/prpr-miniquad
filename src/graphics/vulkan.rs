@@ -1145,6 +1145,15 @@ impl VulkanContext {
         self.recorder.stats()
     }
 
+    pub(crate) fn synchronize_resources(&mut self) {
+        self.drain_submissions();
+        self.flush_recording();
+        unsafe {
+            self.device.queue_wait_idle(self.graphics_queue).expect("Failed to wait for GPU resources");
+        }
+        self.release_frame_resources();
+    }
+
     /// Reclaim host queue and swapchain access from the submission worker.
     ///
     /// Returning from the worker guarantees its `vkQueueSubmit`,

@@ -679,6 +679,7 @@ impl VulkanContext {
     }
 
     pub fn delete_buffer(&mut self, index: usize) {
+        self.synchronize_resources();
         unsafe {
             if self.buffers[index].buffer == vk::Buffer::null() {
                 return;
@@ -860,6 +861,10 @@ impl VulkanContext {
     }
 
     pub fn set_texture_filter(&mut self, index: usize, filter: FilterMode) {
+        if self.textures[index].filter == filter {
+            return;
+        }
+        self.synchronize_resources();
         unsafe {
             self.textures[index].filter = filter;
             let module = &self.textures[index];
@@ -869,6 +874,12 @@ impl VulkanContext {
                 module.wrap,
                 module.mipmap_filter,
             );
+            let old_sampler = self.textures[index].sampler;
+            for info in self.pending.images.iter_mut().flatten() {
+                if info.sampler == old_sampler {
+                    info.sampler = sampler;
+                }
+            }
             if self.textures[index].sampler != vk::Sampler::null() {
                 self.device.destroy_sampler(self.textures[index].sampler, None);
             }
@@ -877,6 +888,10 @@ impl VulkanContext {
     }
 
     pub fn set_texture_wrap(&mut self, index: usize, wrap: TextureWrap) {
+        if self.textures[index].wrap == wrap {
+            return;
+        }
+        self.synchronize_resources();
         unsafe {
             self.textures[index].wrap = wrap;
             let module = &self.textures[index];
@@ -886,6 +901,12 @@ impl VulkanContext {
                 module.wrap,
                 module.mipmap_filter,
             );
+            let old_sampler = self.textures[index].sampler;
+            for info in self.pending.images.iter_mut().flatten() {
+                if info.sampler == old_sampler {
+                    info.sampler = sampler;
+                }
+            }
             if self.textures[index].sampler != vk::Sampler::null() {
                 self.device.destroy_sampler(self.textures[index].sampler, None);
             }
@@ -942,6 +963,7 @@ impl VulkanContext {
         if index >= self.textures.len() {
             return;
         }
+        self.synchronize_resources();
         self.destroy_texture(index);
         self.textures[index] = empty_texture_module();
     }
@@ -1040,6 +1062,7 @@ impl VulkanContext {
         if self.readback_capacity >= size as vk::DeviceSize {
             return;
         }
+        self.drain_submissions();
         unsafe {
             self.device.device_wait_idle().unwrap();
             if self.readback_buffer != vk::Buffer::null() {
@@ -1071,6 +1094,7 @@ impl VulkanContext {
         format: TextureFormat,
         bytes: &mut [u8],
     ) {
+        self.drain_submissions();
         unsafe {
             let image = self.textures[index].image;
             let from_layout = self.textures[index].layout;
@@ -1394,6 +1418,7 @@ impl VulkanContext {
     }
 
     pub fn delete_render_pass(&mut self, index: usize) {
+        self.synchronize_resources();
         let module = self.passes[index].take();
         if let Some(module) = module {
             self.delete_texture(module.color.texture as usize);
