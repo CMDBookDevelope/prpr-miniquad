@@ -158,10 +158,6 @@ impl VulkanContext {
     }
 
     fn begin_frame(&mut self) {
-        if self.presentation_needs_recreate {
-            self.drain_submissions();
-            self.recreate_swapchain();
-        }
         unsafe {
             let fence = self.in_flight[self.current_frame];
             let wait_start = std::time::Instant::now();
@@ -187,6 +183,20 @@ impl VulkanContext {
             }
             self.stream_arenas[slot].offset = 0;
 
+            // Host access to the swapchain is externally synchronized: this
+            // thread's `vkAcquireNextImageKHR` must not run concurrently with
+            // the submission worker's `vkQueuePresentKHR` on the same
+            // swapchain. A finished frame fence only proves the GPU commands
+            // completed; it does not prove the previous `vkQueuePresentKHR`
+            // host call returned. Drain the worker (queue_submit +
+            // queue_present) before touching the swapchain; racing the two
+            // calls makes drivers return spurious `VK_NOT_READY` or deadlock
+            // internally.
+            self.drain_submissions();
+            if self.presentation_needs_recreate {
+                self.recreate_swapchain();
+            }
+
             let (image_index, slot, suboptimal) = loop {
                 let slot = self.acquire_slot;
                 match self.swapchain_loader.acquire_next_image(
@@ -196,9 +206,16 @@ impl VulkanContext {
                     vk::Fence::null(),
                 ) {
                     Ok((image_index, suboptimal)) => break (image_index, slot, suboptimal),
+                    // The swapchain no longer matches the surface; rebuild it
+                    // and try again with the new one.
                     Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                         self.recreate_swapchain();
                     }
+                    // With the worker drained above, `VK_NOT_READY`/`VK_TIMEOUT`
+                    // are not expected: the acquisition blocks until the
+                    // presentation engine returns an image. Anything else means
+                    // the swapchain/device is in a state this backend cannot
+                    // recover from, so fail fast instead of spinning.
                     Err(error) => panic!("Failed to acquire a swapchain image: {:?}", error),
                 }
             };
