@@ -996,6 +996,7 @@ where
             if p.display.update_dimensions(wnd) {
                 let width = p.display.display_data.screen_width as _;
                 let height = p.display.display_data.screen_height as _;
+                p.context.resize(width as u32, height as u32);
                 p.event_handler
                     .resize_event(p.context.with_display(&mut p.display), width, height);
             }

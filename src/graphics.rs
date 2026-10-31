@@ -1205,6 +1205,20 @@ impl Context {
         }
     }
 
+    /// Keep backend-owned presentation resources in sync with the native
+    /// window. OpenGL gets its drawable size from the platform context, while
+    /// Vulkan needs the new extent when an out-of-date swapchain is rebuilt.
+    pub(crate) fn resize(&mut self, width: u32, height: u32) {
+        #[cfg(feature = "vulkan")]
+        if width > 0 && height > 0 {
+            if let GraphicsBackend::Vulkan(ctx) = &mut self.backend {
+                ctx.set_window_size(width, height);
+            }
+        }
+        #[cfg(not(feature = "vulkan"))]
+        let _ = (width, height);
+    }
+
     /// Release the backend's GPU resources before the window goes away.
     pub(crate) fn cleanup_backend(&mut self) {
         #[cfg(feature = "vulkan")]

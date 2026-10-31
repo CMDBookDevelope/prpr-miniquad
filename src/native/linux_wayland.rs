@@ -13,14 +13,14 @@ use libwayland_egl::*;
 use crate::{
     event::EventHandler,
     native::{egl, NativeDisplayData},
-    Context, GraphicsContext,
+    Context,
 };
 
 pub(crate) struct WaylandDisplay {
     client: LibWaylandClient,
     // this is libwayland-egl.so, a library with ~4 functions
     // not the libEGL.so(which will be loaded, but not here)
-    egl: LibWaylandEgl,
+    egl: Option<LibWaylandEgl>,
     compositor: *mut wl_compositor,
     subcompositor: *mut wl_subcompositor,
     xdg_toplevel: *mut extensions::xdg_shell::xdg_toplevel,
@@ -79,7 +79,7 @@ impl crate::native::NativeDisplay for WaylandDisplay {
 /// A thing to pass around within *void pointer of wayland's event handler
 struct WaylandPayload {
     display: WaylandDisplay,
-    context: Option<GraphicsContext>,
+    context: Option<Context>,
     event_handler: Option<Box<dyn EventHandler>>,
 }
 
@@ -289,7 +289,13 @@ unsafe extern "C" fn xdg_toplevel_handle_configure(
         } else {
             (width, height)
         };
-        (display.egl.wl_egl_window_resize)(display.egl_window, egl_w, egl_h, 0, 0);
+        let egl_w = egl_w.max(1);
+        let egl_h = egl_h.max(1);
+        if let Some(egl) = &display.egl {
+            if !display.egl_window.is_null() {
+                (egl.wl_egl_window_resize)(display.egl_window, egl_w, egl_h, 0, 0);
+            }
+        }
 
         display.data.screen_width = width;
         display.data.screen_height = height;
@@ -298,9 +304,15 @@ unsafe extern "C" fn xdg_toplevel_handle_configure(
             decorations.resize(&mut display.client, width, height);
         }
 
-        drop(display);
-        if let (mut context, Some(event_handler)) = payload.context() {
-            event_handler.resize_event(&mut context, width as _, height as _);
+        if let Some(context) = &mut payload.context {
+            context.resize(egl_w as u32, egl_h as u32);
+            if let Some(event_handler) = &mut payload.event_handler {
+                event_handler.resize_event(
+                    context.with_display(&mut payload.display),
+                    width as _,
+                    height as _,
+                );
+            }
         }
     }
 }
@@ -310,8 +322,13 @@ where
     F: 'static + FnOnce(&mut Context) -> Box<dyn EventHandler>,
 {
     unsafe {
+        let vulkan = conf.platform.rendering_backend == crate::conf::RenderingBackend::Vulkan;
         let client = LibWaylandClient::try_load()?;
-        let egl = LibWaylandEgl::try_load()?;
+        let egl = if vulkan {
+            None
+        } else {
+            Some(LibWaylandEgl::try_load()?)
+        };
 
         let wdisplay = (client.wl_display_connect)(std::ptr::null_mut());
         if wdisplay.is_null() {
@@ -374,14 +391,6 @@ where
             println!("Decoration manager not found, will draw fallback decorations");
         }
 
-        let mut libegl = egl::LibEgl::try_load()?;
-        let (context, config, egl_display) = egl::create_egl_context(
-            &mut libegl,
-            wdisplay as *mut _,
-            conf.platform.framebuffer_alpha,
-        )
-        .unwrap();
-
         payload.display.surface = wl_request_constructor!(
             payload.display.client,
             payload.display.compositor,
@@ -435,31 +444,6 @@ where
         );
         (payload.display.client.wl_display_roundtrip)(wdisplay);
 
-        payload.display.egl_window = (payload.display.egl.wl_egl_window_create)(
-            payload.display.surface as _,
-            conf.window_width as _,
-            conf.window_height as _,
-        );
-
-        let egl_surface = (libegl.eglCreateWindowSurface.unwrap())(
-            egl_display,
-            config,
-            payload.display.egl_window as _,
-            std::ptr::null_mut(),
-        );
-
-        if egl_surface == /* EGL_NO_SURFACE  */ std::ptr::null_mut() {
-            panic!("surface creation failed");
-        }
-        if (libegl.eglMakeCurrent.unwrap())(egl_display, egl_surface, egl_surface, context) == 0 {
-            panic!("eglMakeCurrent failed");
-        }
-
-        crate::native::gl::load_gl_funcs(|proc| {
-            let name = std::ffi::CString::new(proc).unwrap();
-            libegl.eglGetProcAddress.expect("non-null function pointer")(name.as_ptr() as _)
-        });
-
         if payload.display.decoration_manager.is_null() == false {
             let server_decoration: *mut extensions::xdg_decoration::zxdg_toplevel_decoration_v1 = wl_request_constructor!(
                 payload.display.client,
@@ -484,9 +468,85 @@ where
             ));
         }
 
-        payload.context = Some(crate::GraphicsContext::new(false));
-        payload.display.data.screen_width = conf.window_width;
-        payload.display.data.screen_height = conf.window_height;
+        if payload.display.data.screen_width <= 0 || payload.display.data.screen_height <= 0 {
+            payload.display.data.screen_width = conf.window_width;
+            payload.display.data.screen_height = conf.window_height;
+        }
+        let (drawable_width, drawable_height) = if payload.display.decorations.is_some() {
+            (
+                payload.display.data.screen_width - decorations::Decorations::WIDTH * 2,
+                payload.display.data.screen_height
+                    - decorations::Decorations::BAR_HEIGHT
+                    - decorations::Decorations::WIDTH,
+            )
+        } else {
+            (
+                payload.display.data.screen_width,
+                payload.display.data.screen_height,
+            )
+        };
+        let drawable_width = drawable_width.max(1) as u32;
+        let drawable_height = drawable_height.max(1) as u32;
+
+        let mut opengl = if vulkan {
+            None
+        } else {
+            let mut libegl = egl::LibEgl::try_load()?;
+            let (egl_context, config, egl_display) = egl::create_egl_context(
+                &mut libegl,
+                wdisplay as *mut _,
+                conf.platform.framebuffer_alpha,
+            )
+            .unwrap();
+            let wayland_egl = payload.display.egl.as_ref().unwrap();
+            payload.display.egl_window = (wayland_egl.wl_egl_window_create)(
+                payload.display.surface as _,
+                drawable_width as _,
+                drawable_height as _,
+            );
+            let egl_surface = (libegl.eglCreateWindowSurface.unwrap())(
+                egl_display,
+                config,
+                payload.display.egl_window as _,
+                std::ptr::null_mut(),
+            );
+            if egl_surface.is_null() {
+                panic!("surface creation failed");
+            }
+            if (libegl.eglMakeCurrent.unwrap())(egl_display, egl_surface, egl_surface, egl_context)
+                == 0
+            {
+                panic!("eglMakeCurrent failed");
+            }
+            crate::native::gl::load_gl_funcs(|proc| {
+                let name = std::ffi::CString::new(proc).unwrap();
+                libegl.eglGetProcAddress.expect("non-null function pointer")(name.as_ptr() as _)
+            });
+            Some((libegl, egl_display, egl_surface))
+        };
+
+        payload.context = Some(if vulkan {
+            let mut display_handle = raw_window_handle::WaylandDisplayHandle::empty();
+            display_handle.display = wdisplay as *mut _;
+            let mut window_handle = raw_window_handle::WaylandWindowHandle::empty();
+            window_handle.surface = payload.display.surface as *mut _;
+            Context::new(
+                crate::conf::RenderingBackend::Vulkan,
+                false,
+                Some((
+                    raw_window_handle::RawDisplayHandle::Wayland(display_handle),
+                    raw_window_handle::RawWindowHandle::Wayland(window_handle),
+                )),
+                (drawable_width, drawable_height),
+            )
+        } else {
+            Context::new(
+                crate::conf::RenderingBackend::OpenGL,
+                false,
+                None,
+                (drawable_width, drawable_height),
+            )
+        });
 
         let event_handler = (f.take().unwrap())(&mut payload.context().0);
         payload.event_handler = Some(event_handler);
@@ -498,7 +558,19 @@ where
             event_handler.as_mut().unwrap().update(&mut context);
             event_handler.as_mut().unwrap().draw(&mut context);
 
-            (libegl.eglSwapBuffers.unwrap())(egl_display, egl_surface);
+            if let Some((libegl, egl_display, egl_surface)) = &mut opengl {
+                (libegl.eglSwapBuffers.unwrap())(*egl_display, *egl_surface);
+            } else {
+                payload.context.as_mut().unwrap().swap_buffers();
+            }
+        }
+
+        if vulkan {
+            payload.context.as_mut().unwrap().cleanup_backend();
+        }
+        if !payload.display.egl_window.is_null() {
+            let egl = payload.display.egl.as_ref().unwrap();
+            (egl.wl_egl_window_destroy)(payload.display.egl_window);
         }
     }
 

@@ -801,8 +801,18 @@ impl VulkanContext {
                 .unwrap_or(vk::PresentModeKHR::FIFO);
 
             let (width, height) = window_size;
+            let requested_extent = vk::Extent2D {
+                width: width.clamp(
+                    surface_capabilities.min_image_extent.width,
+                    surface_capabilities.max_image_extent.width,
+                ),
+                height: height.clamp(
+                    surface_capabilities.min_image_extent.height,
+                    surface_capabilities.max_image_extent.height,
+                ),
+            };
             self.swapchain_extent = match surface_capabilities.current_extent.width {
-                std::u32::MAX => vk::Extent2D { width, height },
+                std::u32::MAX => requested_extent,
                 _ => surface_capabilities.current_extent,
             };
 
@@ -1103,7 +1113,11 @@ impl VulkanContext {
     }
 
     pub fn set_window_size(&mut self, width: u32, height: u32) {
-        self.window_size = (width, height);
+        let size = (width, height);
+        if self.window_size != size {
+            self.window_size = size;
+            self.presentation_needs_recreate = true;
+        }
     }
 
     pub(crate) fn recreate_swapchain(&mut self) {

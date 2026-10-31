@@ -11,7 +11,6 @@ mod xi_input;
 use crate::{
     event::EventHandler,
     gl,
-    graphics::GraphicsContext,
     native::{egl, NativeDisplayData},
     Context, CursorIcon,
 };
@@ -455,7 +454,7 @@ impl X11Display {
 
     unsafe fn process_event(
         &mut self,
-        context: &mut GraphicsContext,
+        context: &mut Context,
         event_handler: &mut dyn EventHandler,
         event: &mut XEvent,
     ) {
@@ -582,6 +581,7 @@ impl X11Display {
                     let height = (*event).xconfigure.height;
                     self.data.screen_width = width;
                     self.data.screen_height = height;
+                    context.resize(width as u32, height as u32);
                     event_handler.resize_event(
                         context.with_display(&mut *self),
                         width as f32,
@@ -698,7 +698,7 @@ where
     let window = display.create_window(visual, depth, conf);
     display.window = window;
     let (glx_context, glx_window) =
-            glx.create_context(&mut display, window, conf.platform.opengl_version);
+        glx.create_context(&mut display, window, conf.platform.opengl_version);
     glx.swap_interval(
         &mut display,
         glx_window,
@@ -722,7 +722,12 @@ where
     display.data.screen_width = w;
     display.data.screen_height = h;
 
-    let mut context = GraphicsContext::new(gl::is_gl2());
+    let mut context = Context::new(
+        crate::conf::RenderingBackend::OpenGL,
+        gl::is_gl2(),
+        None,
+        (w as u32, h as u32),
+    );
 
     let mut data = (f.take().unwrap())(context.with_display(&mut display));
 
@@ -810,11 +815,16 @@ where
 
     (display.libx11.XFlush)(display.display);
 
-    let mut context = GraphicsContext::new(gl::is_gl2());
-
     let (w, h) = display.query_window_size(window);
     display.data.screen_width = w;
     display.data.screen_height = h;
+
+    let mut context = Context::new(
+        crate::conf::RenderingBackend::OpenGL,
+        gl::is_gl2(),
+        None,
+        (w as u32, h as u32),
+    );
 
     let mut data = (f.take().unwrap())(context.with_display(&mut display));
 
@@ -841,6 +851,64 @@ where
     // (display.libx11.XCloseDisplay)(display.display);
 
     Ok(())
+}
+
+unsafe fn vulkan_main_loop<F>(mut display: X11Display, conf: &crate::conf::Conf, f: &mut Option<F>)
+where
+    F: 'static + FnOnce(&mut Context) -> Box<dyn EventHandler>,
+{
+    let window = display.create_window(std::ptr::null_mut(), 0, conf);
+    display.window = window;
+
+    if !conf.headless {
+        display.show_window(window);
+    }
+
+    if conf.fullscreen {
+        display.set_fullscreen(window, true);
+    }
+
+    (display.libx11.XFlush)(display.display);
+
+    let (width, height) = display.query_window_size(window);
+    display.data.screen_width = width;
+    display.data.screen_height = height;
+
+    let mut display_handle = raw_window_handle::XlibDisplayHandle::empty();
+    display_handle.display = display.display as *mut _;
+    display_handle.screen = display.screen;
+    let mut window_handle = raw_window_handle::XlibWindowHandle::empty();
+    window_handle.window = window;
+
+    let raw_display = raw_window_handle::RawDisplayHandle::Xlib(display_handle);
+    let raw_window = raw_window_handle::RawWindowHandle::Xlib(window_handle);
+    let mut context = Context::new(
+        crate::conf::RenderingBackend::Vulkan,
+        false,
+        Some((raw_display, raw_window)),
+        (width as u32, height as u32),
+    );
+    let mut data = (f.take().unwrap())(context.with_display(&mut display));
+
+    while !display.data.quit_ordered {
+        let count = (display.libx11.XPending)(display.display);
+        for _ in 0..count {
+            let mut event = _XEvent { type_0: 0 };
+            (display.libx11.XNextEvent)(display.display, &mut event);
+            display.process_event(&mut context, &mut *data, &mut event);
+        }
+
+        data.update(context.with_display(&mut display));
+        data.draw(context.with_display(&mut display));
+        context.swap_buffers();
+
+        (display.libx11.XFlush)(display.display);
+    }
+
+    context.cleanup_backend();
+    (display.libx11.XUnmapWindow)(display.display, window);
+    (display.libx11.XDestroyWindow)(display.display, window);
+    (display.libx11.XCloseDisplay)(display.display);
 }
 
 pub fn run<F>(conf: &crate::conf::Conf, f: &mut Option<F>) -> Option<()>
@@ -893,6 +961,11 @@ where
             data: Default::default(),
         };
         display.update_system_dpi();
+
+        if conf.platform.rendering_backend == crate::conf::RenderingBackend::Vulkan {
+            vulkan_main_loop(display, conf, f);
+            return Some(());
+        }
 
         match conf.platform.linux_x11_gl {
             crate::conf::LinuxX11Gl::GLXOnly => {
