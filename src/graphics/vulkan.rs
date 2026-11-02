@@ -271,6 +271,27 @@ impl VulkanContext {
         window: RawWindowHandle,
         window_size: (u32, u32),
     ) -> VulkanContext {
+        Self::build(Some((display, window)), window_size)
+    }
+
+    /// Headless Vulkan context: no surface, no swapchain, no window.
+    ///
+    /// The video exporter renders into its own offscreen targets and drives the
+    /// frame ring through `enable_offscreen_video` / `begin_offscreen_frame`, so
+    /// the present path is never touched. This is what lets the CLI run on a
+    /// machine without X11/Wayland.
+    pub fn new_headless(window_size: (u32, u32)) -> VulkanContext {
+        let mut context = Self::build(None, window_size);
+        // Allocate the offscreen frame ring up front: the exporter and macroquad's
+        // default-pass guard both expect offscreen mode to be active.
+        context.enable_offscreen_video();
+        context
+    }
+
+    fn build(
+        surface_handles: Option<(RawDisplayHandle, RawWindowHandle)>,
+        window_size: (u32, u32),
+    ) -> VulkanContext {
         unsafe {
             let entry = Entry::load().expect("Failed to load the Vulkan loader");
             let app_name = CStr::from_bytes_with_nul_unchecked(b"miniquad\0");
@@ -290,8 +311,14 @@ impl VulkanContext {
                 Vec::new()
             };
 
-            let mut extension_names =
-                ash_window::enumerate_required_extensions(display).unwrap().to_vec();
+            // A surface-less context must not ask for WSI extensions: some
+            // drivers expose them only when a display is present.
+            let mut extension_names = match surface_handles {
+                Some((display, _)) => {
+                    ash_window::enumerate_required_extensions(display).unwrap().to_vec()
+                }
+                None => Vec::new(),
+            };
             if validation {
                 extension_names.push(DebugUtils::name().as_ptr());
             }
@@ -339,8 +366,10 @@ impl VulkanContext {
                 None
             };
 
-            let surface = ash_window::create_surface(&entry, &instance, display, window, None)
-                .expect("Failed to create a Vulkan surface for the window");
+            let surface = surface_handles.map(|(display, window)| {
+                ash_window::create_surface(&entry, &instance, display, window, None)
+                    .expect("Failed to create a Vulkan surface for the window")
+            });
 
             let surface_loader = Surface::new(&entry, &instance);
 
@@ -356,14 +385,17 @@ impl VulkanContext {
                         .iter()
                         .enumerate()
                         .find_map(|(index, info)| {
-                            let graphics_and_surface = info.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-                                && surface_loader
-                                    .get_physical_device_surface_support(
-                                        *device,
-                                        index as u32,
-                                        surface,
-                                    )
-                                    .unwrap();
+                            let has_graphics = info.queue_flags.contains(vk::QueueFlags::GRAPHICS);
+                            let graphics_and_surface = has_graphics
+                                && surface.map_or(true, |surface| {
+                                    surface_loader
+                                        .get_physical_device_surface_support(
+                                            *device,
+                                            index as u32,
+                                            surface,
+                                        )
+                                        .unwrap()
+                                });
                             if graphics_and_surface {
                                 Some((*device, index as u32))
                             } else {
@@ -397,7 +429,10 @@ impl VulkanContext {
                 None
             };
 
-            let mut device_extension_names = vec![Swapchain::name().as_ptr()];
+            let mut device_extension_names = Vec::new();
+            if surface.is_some() {
+                device_extension_names.push(Swapchain::name().as_ptr());
+            }
             if video_queue_supported {
                 device_extension_names.push(cstr("VK_KHR_video_queue").as_ptr());
                 device_extension_names.push(cstr("VK_KHR_video_encode_queue").as_ptr());
@@ -443,6 +478,10 @@ impl VulkanContext {
                 .unwrap_or(vk::Queue::null());
             let memory_properties = instance.get_physical_device_memory_properties(physical_device);
             let properties = instance.get_physical_device_properties(physical_device);
+            if surface.is_none() && std::env::var_os("MINIQUAD_VULKAN_VERBOSE").is_some() {
+                let name = CStr::from_ptr(properties.device_name.as_ptr()).to_string_lossy();
+                eprintln!("[miniquad] headless Vulkan device: {name}");
+            }
             let max_texture_size = properties.limits.max_image_dimension2_d;
             let uniform_alignment = properties.limits.min_uniform_buffer_offset_alignment;
             let color_sample_counts = properties.limits.framebuffer_color_sample_counts;
@@ -490,7 +529,7 @@ impl VulkanContext {
                 debug_utils_loader,
                 debug_messenger,
 
-                surface,
+                surface: surface.unwrap_or(vk::SurfaceKHR::null()),
                 physical_device,
                 memory_properties,
                 max_texture_size,
@@ -583,7 +622,9 @@ impl VulkanContext {
             );
             context.create_uniform_arenas();
             context.create_stream_arenas();
-            context.create_swapchain(window_size);
+            if surface.is_some() {
+                context.create_swapchain(window_size);
+            }
             context
         }
     }

@@ -949,14 +949,16 @@ impl Context {
             },
             #[cfg(feature = "vulkan")]
             crate::conf::RenderingBackend::Vulkan => {
-                let (display, handle) =
-                    window.expect("The Vulkan backend requires raw window handles");
+                let context = match window {
+                    Some((display, handle)) => {
+                        vulkan::VulkanContext::new(display, handle, window_size)
+                    }
+                    // No window: used by the headless CLI. The exporter never
+                    // presents, so no surface/swapchain is needed.
+                    None => vulkan::VulkanContext::new_headless(window_size),
+                };
                 Context {
-                    backend: GraphicsBackend::Vulkan(vulkan::VulkanContext::new(
-                        display,
-                        handle,
-                        window_size,
-                    )),
+                    backend: GraphicsBackend::Vulkan(context),
                     features: Features {
                         instancing: true,
                         alpha_texture: false,

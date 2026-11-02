@@ -155,11 +155,84 @@ unsafe fn create_pbuffer_context(
     Ok((context, config, display, surface))
 }
 
+/// Minimal display for the surface-less Vulkan backend.
+///
+/// `Context::screen_size` / `dpi_scale` go through the display pointer, so even
+/// a windowless context needs one. Nothing here ever interacts with a real
+/// window server.
+struct VulkanHeadlessDisplay {
+    width: f32,
+    height: f32,
+    quit: bool,
+}
+
+impl crate::native::NativeDisplay for VulkanHeadlessDisplay {
+    fn screen_size(&self) -> (f32, f32) {
+        (self.width, self.height)
+    }
+    fn dpi_scale(&self) -> f32 {
+        1.0
+    }
+    fn high_dpi(&self) -> bool {
+        false
+    }
+    fn order_quit(&mut self) {
+        self.quit = true;
+    }
+    fn request_quit(&mut self) {
+        self.quit = true;
+    }
+    fn cancel_quit(&mut self) {
+        self.quit = false;
+    }
+    fn set_cursor_grab(&mut self, _grab: bool) {}
+    fn show_mouse(&mut self, _shown: bool) {}
+    fn set_mouse_cursor(&mut self, _cursor_icon: crate::CursorIcon) {}
+    fn set_window_size(&mut self, _new_width: u32, _new_height: u32) {}
+    fn set_fullscreen(&mut self, _fullscreen: bool) {}
+    fn clipboard_get(&mut self) -> Option<String> {
+        None
+    }
+    fn clipboard_set(&mut self, _data: &str) {}
+    fn as_any(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
 /// Main entry point for headless rendering.
 pub fn run<F>(conf: &Conf, f: &mut Option<F>) -> Option<()>
 where
     F: 'static + FnOnce(&mut Context) -> Box<dyn EventHandler>,
 {
+    // Vulkan does not need EGL at all: build a surface-less context and let the
+    // exporter drive its offscreen frame ring. This is the path the CLI uses on
+    // machines without X11/Wayland.
+    if matches!(
+        conf.platform.rendering_backend,
+        crate::conf::RenderingBackend::Vulkan
+    ) {
+        let mut display = VulkanHeadlessDisplay {
+            width: conf.window_width as f32,
+            height: conf.window_height as f32,
+            quit: false,
+        };
+        let mut context = Context::new(
+            crate::conf::RenderingBackend::Vulkan,
+            false,
+            None,
+            (conf.window_width as u32, conf.window_height as u32),
+        );
+        context.display = Some(&mut display as *mut _ as *mut dyn crate::native::NativeDisplay);
+        let mut event_handler = (f.take().unwrap())(&mut context);
+        while !display.quit {
+            event_handler.update(&mut context);
+            event_handler.draw(&mut context);
+            // The exporter terminates the process itself once the file is written;
+            // there is no window and therefore no OS quit event to observe.
+        }
+        return Some(());
+    }
+
     unsafe {
         // Load EGL library
         let mut libegl = egl::LibEgl::try_load()?;

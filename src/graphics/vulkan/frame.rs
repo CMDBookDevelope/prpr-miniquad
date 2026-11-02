@@ -158,6 +158,11 @@ impl VulkanContext {
     }
 
     fn begin_frame(&mut self) {
+        if !self.has_swapchain() {
+            // Headless: there is no image to acquire; record into the offscreen ring.
+            self.begin_offscreen_frame();
+            return;
+        }
         unsafe {
             let fence = self.in_flight[self.current_frame];
             let wait_start = std::time::Instant::now();
@@ -269,6 +274,15 @@ impl VulkanContext {
     ///
     /// Must be called once, before the first `begin_offscreen_frame`, while the
     /// device is idle.
+    /// Whether this context has a presentation surface (i.e. a real window).
+    ///
+    /// A headless context has no swapchain, so the exporter must stay on the
+    /// offscreen NV12 path and must not use the Vulkan Video encoder, which is
+    /// driven from per-frame swapchain recording.
+    pub fn has_swapchain(&self) -> bool {
+        self.swapchain != vk::SwapchainKHR::null()
+    }
+
     pub fn enable_offscreen_video(&mut self) {
         if self.offscreen {
             return;
@@ -1533,6 +1547,11 @@ impl VulkanContext {
     pub fn commit_frame(&mut self) {}
 
     pub fn present(&mut self) {
+        if !self.has_swapchain() {
+            // Headless: submit the offscreen frame instead of presenting.
+            self.finish_offscreen_frame();
+            return;
+        }
         if !self.frame_active {
             return;
         }
