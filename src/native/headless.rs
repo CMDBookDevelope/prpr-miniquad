@@ -187,7 +187,8 @@ where
         });
 
         // Create GraphicsContext (will detect GL version)
-        let mut graphics_ctx = GraphicsContext::new(gl::is_gl2());
+        let is_gles2 = gl::is_gl2();
+        let graphics_ctx = GraphicsContext::new(is_gles2);
 
         // Build display state
         let mut display = HeadlessDisplay {
@@ -200,7 +201,14 @@ where
             height: conf.window_height as u32,
             data: NativeDisplayData::default(),
         };        // Pass display to user's event handler
-        let mut context = graphics_ctx.with_display(&mut display);
+        // `Context` wraps the backend-specific context and holds the display
+        // pointer; there is no `with_display` helper anymore.
+        let display_ptr: *mut dyn crate::NativeDisplay = &mut display;
+        let mut context = Context {
+            backend: crate::graphics::GraphicsBackend::OpenGL(graphics_ctx),
+            features: crate::graphics::Features::from_gles2(is_gles2),
+            display: Some(display_ptr),
+        };
         let mut event_handler = (f.take().unwrap())(&mut context);
         unsafe {
             let renderer = std::ffi::CStr::from_ptr(gl::glGetString(gl::GL_RENDERER) as *const _)
