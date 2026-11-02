@@ -14,7 +14,7 @@ use {
             },
             NativeDisplayData,
         },
-        Context, GraphicsContext,
+        Context,
     },
     std::os::raw::c_void,
     std::sync::Mutex,
@@ -68,7 +68,7 @@ impl crate::native::NativeDisplay for IosDisplay {
 
 struct WindowPayload {
     display: IosDisplay,
-    context: Option<GraphicsContext>,
+    context: Option<Context>,
     event_handler: Option<Box<dyn EventHandler>>,
     gles2: bool,
     f: Option<Box<dyn 'static + FnOnce(&mut crate::Context) -> Box<dyn EventHandler>>>,
@@ -174,7 +174,13 @@ pub fn define_glk_view_dlg() -> *const Class {
         let payload = get_window_payload(this);
         if payload.event_handler.is_none() {
             let f = payload.f.take().unwrap();
-            payload.context = Some(GraphicsContext::new(payload.gles2));
+            // OpenGL backend; the window size is only used by the Vulkan path.
+            payload.context = Some(Context::new(
+                crate::conf::RenderingBackend::OpenGL,
+                payload.gles2,
+                None,
+                (0, 0),
+            ));
             payload.event_handler = Some(f(payload
                 .context
                 .as_mut()

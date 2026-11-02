@@ -2,7 +2,7 @@ use crate::{
     event::{EventHandler, KeyCode, TouchPhase},
     native::egl::{self, LibEgl},
     native::NativeDisplay,
-    GraphicsContext,
+    Context,
 };
 
 use std::{cell::RefCell, sync::mpsc, thread};
@@ -208,7 +208,7 @@ pub unsafe fn console_error(msg: *const ::std::os::raw::c_char) {
 
 struct MainThreadState {
     libegl: LibEgl,
-    context: GraphicsContext,
+    context: Context,
     egl_display: egl::EGLDisplay,
     egl_config: egl::EGLConfig,
     egl_context: egl::EGLContext,
@@ -469,7 +469,12 @@ where
             panic!();
         }
 
-        let mut context = GraphicsContext::new(gl::is_gl2());
+        let mut context = Context::new(
+            crate::conf::RenderingBackend::OpenGL,
+            gl::is_gl2(),
+            None,
+            (screen_width as u32, screen_height as u32),
+        );
 
         let mut display = AndroidDisplay {
             screen_width,
