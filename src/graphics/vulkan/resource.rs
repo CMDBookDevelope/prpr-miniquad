@@ -733,9 +733,17 @@ impl VulkanContext {
                 mip_levels,
                 vk::SampleCountFlags::TYPE_1,
             );
-            let view = self.create_image_view(image, format, depth, mip_levels, params.format, false);
+            let view = self.create_image_view(
+                image,
+                format,
+                depth,
+                mip_levels,
+                params.format,
+                false,
+                access != TextureAccess::RenderTarget,
+            );
             let sample_view = if opaque {
-                Some(self.create_image_view(image, format, false, mip_levels, params.format, true))
+                Some(self.create_image_view(image, format, false, mip_levels, params.format, true, false))
             } else {
                 None
             };
@@ -807,6 +815,7 @@ impl VulkanContext {
         mip_levels: u32,
         texture_format: TextureFormat,
         opaque: bool,
+        swizzle: bool,
     ) -> vk::ImageView {
         let components = if opaque {
             vk::ComponentMapping {
@@ -816,14 +825,20 @@ impl VulkanContext {
                 a: vk::ComponentSwizzle::ONE,
             }
         } else {
+            // Alpha / LuminanceAlpha are sampled as GL-style (0,0,0,A) textures, but
+            // the same view is used as a colour attachment when the texture is a render
+            // target.  Vulkan applies the component mapping to attachment writes too, so
+            // a swizzled view would discard the value the shader writes (e.g. the luma
+            // plane came out as all zero and the video turned green).  Render targets
+            // therefore get an unswizzled view.
             match texture_format {
-                TextureFormat::Alpha => vk::ComponentMapping {
+                TextureFormat::Alpha if swizzle => vk::ComponentMapping {
                     r: vk::ComponentSwizzle::ZERO,
                     g: vk::ComponentSwizzle::ZERO,
                     b: vk::ComponentSwizzle::ZERO,
                     a: vk::ComponentSwizzle::R,
                 },
-                TextureFormat::LuminanceAlpha => vk::ComponentMapping {
+                TextureFormat::LuminanceAlpha if swizzle => vk::ComponentMapping {
                     r: vk::ComponentSwizzle::R,
                     g: vk::ComponentSwizzle::ZERO,
                     b: vk::ComponentSwizzle::ZERO,
@@ -1447,7 +1462,7 @@ impl VulkanContext {
                 1,
                 sample_count,
             );
-            let view = self.create_image_view(image, format, false, 1, params.format, false);
+            let view = self.create_image_view(image, format, false, 1, params.format, false, false);
 
             let index = self.textures.len();
             self.textures.push(TextureModule {
