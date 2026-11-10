@@ -4,6 +4,10 @@ mod texture;
 
 #[cfg(feature = "vulkan")]
 mod vulkan;
+#[cfg(feature = "metal")]
+pub mod metal;
+#[cfg(any(feature = "metal", feature = "metal-shaders"))]
+pub mod metal_shader;
 
 use crate::native::gl::*;
 
@@ -319,6 +323,10 @@ impl Shader {
             GraphicsBackend::Vulkan(_) => ctx
                 .vulkan()
                 .new_shader(vertex_shader, fragment_shader, meta),
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(_) => ctx
+                .metal()
+                .new_shader(vertex_shader, fragment_shader, meta),
         }
     }
 }
@@ -624,6 +632,10 @@ impl RenderPass {
             GraphicsBackend::Vulkan(_) => {
                 RenderPass(ctx.vulkan().new_render_pass(color_img, depth_img))
             }
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(_) => {
+                RenderPass(ctx.metal().new_render_pass(color_img, depth_img))
+            }
         }
     }
 
@@ -674,6 +686,8 @@ impl RenderPass {
                 let pass = vk_ctx.new_multisampled_render_pass(color, resolve_img, samples);
                 RenderPass(pass)
             }
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(_) => RenderPass(ctx.metal().new_msaa_pass(resolve_img, samples)),
         }
     }
 
@@ -683,6 +697,11 @@ impl RenderPass {
             GraphicsBackend::OpenGL(_) => ctx.opengl().passes[self.0].samples,
             #[cfg(feature = "vulkan")]
             GraphicsBackend::Vulkan(_) => ctx.vulkan().passes[self.0]
+                .as_ref()
+                .expect("the render pass has been deleted")
+                .samples,
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(_) => ctx.metal().passes[self.0]
                 .as_ref()
                 .expect("the render pass has been deleted")
                 .samples,
@@ -817,6 +836,11 @@ impl RenderPass {
                 .as_ref()
                 .expect("the render pass has been deleted")
                 .color,
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(_) => ctx.metal().passes[self.0]
+                .as_ref()
+                .expect("the render pass has been deleted")
+                .color,
         }
     }
 
@@ -836,6 +860,8 @@ impl RenderPass {
             }
             #[cfg(feature = "vulkan")]
             GraphicsBackend::Vulkan(_) => ctx.vulkan().delete_render_pass(self.0),
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(_) => ctx.metal().delete_render_pass(self.0),
         }
     }
 }
@@ -916,6 +942,8 @@ impl GraphicsContext {
 }
 /// The rendering backend a [`Context`] is bound to.
 pub enum GraphicsBackend {
+    #[cfg(feature = "metal")]
+    Metal(metal::MetalContext),
     OpenGL(GraphicsContext),
     #[cfg(feature = "vulkan")]
     Vulkan(vulkan::VulkanContext),
@@ -942,6 +970,14 @@ impl Context {
         window_size: (u32, u32),
     ) -> Context {
         match backend {
+            #[cfg(feature = "metal")]
+            crate::conf::RenderingBackend::Metal => Context {
+                backend: GraphicsBackend::Metal(metal::MetalContext::new(window_size)),
+                features: Features { instancing: true, alpha_texture: true },
+                display: None,
+            },
+            #[cfg(not(feature = "metal"))]
+            crate::conf::RenderingBackend::Metal => panic!("Metal requires the metal feature"),
             crate::conf::RenderingBackend::OpenGL => Context {
                 backend: GraphicsBackend::OpenGL(GraphicsContext::new(is_gles2)),
                 features: Features::from_gles2(is_gles2),
@@ -982,6 +1018,8 @@ impl Context {
             GraphicsBackend::OpenGL(_) => crate::conf::RenderingBackend::OpenGL,
             #[cfg(feature = "vulkan")]
             GraphicsBackend::Vulkan(_) => crate::conf::RenderingBackend::Vulkan,
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(_) => crate::conf::RenderingBackend::Metal,
         }
     }
 
@@ -996,6 +1034,10 @@ impl Context {
             GraphicsBackend::Vulkan(_) => {
                 panic!("This call requires the OpenGL backend, the context is running Vulkan")
             }
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(_) => {
+                panic!("This call requires the OpenGL backend, the context is running Vulkan")
+            }
         }
     }
 
@@ -1006,6 +1048,8 @@ impl Context {
     /// handles beyond it must coordinate later access with the renderer.
     pub fn vulkan_context(&mut self) -> Option<&mut vulkan::VulkanContext> {
         match &mut self.backend {
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(_) => None,
             GraphicsBackend::Vulkan(ctx) => {
                 ctx.drain_submissions();
                 Some(ctx)
@@ -1017,6 +1061,8 @@ impl Context {
     #[cfg(feature = "vulkan")]
     pub(crate) fn vulkan(&mut self) -> &mut vulkan::VulkanContext {
         match &mut self.backend {
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(_) => panic!("This call requires Vulkan"),
             GraphicsBackend::Vulkan(ctx) => ctx,
             GraphicsBackend::OpenGL(_) => {
                 panic!("This call requires the Vulkan backend, the context is running OpenGL")
@@ -1024,11 +1070,22 @@ impl Context {
         }
     }
 
+    #[cfg(feature = "metal")]
+    pub fn metal_context(&mut self) -> Option<&mut metal::MetalContext> {
+        match &mut self.backend { GraphicsBackend::Metal(ctx) => Some(ctx), _ => None }
+    }
+    #[cfg(feature = "metal")]
+    pub(crate) fn metal(&mut self) -> &mut metal::MetalContext {
+        self.metal_context().expect("This call requires Metal")
+    }
+
     pub fn apply_pipeline(&mut self, pipeline: &Pipeline) {
         match &mut self.backend {
             GraphicsBackend::OpenGL(ctx) => ctx.apply_pipeline(pipeline),
             #[cfg(feature = "vulkan")]
             GraphicsBackend::Vulkan(ctx) => ctx.apply_pipeline(pipeline),
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(ctx) => ctx.apply_pipeline(pipeline),
         }
     }
 
@@ -1037,6 +1094,8 @@ impl Context {
             GraphicsBackend::OpenGL(ctx) => ctx.set_cull_face(cull_face),
             #[cfg(feature = "vulkan")]
             GraphicsBackend::Vulkan(ctx) => ctx.set_cull_face(cull_face),
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(ctx) => ctx.set_cull_face(cull_face),
         }
     }
 
@@ -1045,6 +1104,8 @@ impl Context {
             GraphicsBackend::OpenGL(ctx) => ctx.set_color_write(color_write),
             #[cfg(feature = "vulkan")]
             GraphicsBackend::Vulkan(ctx) => ctx.set_color_write(color_write),
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(ctx) => ctx.set_color_write(color_write),
         }
     }
 
@@ -1053,6 +1114,8 @@ impl Context {
             GraphicsBackend::OpenGL(ctx) => ctx.set_blend(color_blend, alpha_blend),
             #[cfg(feature = "vulkan")]
             GraphicsBackend::Vulkan(ctx) => ctx.set_blend(color_blend, alpha_blend),
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(ctx) => ctx.set_blend(color_blend, alpha_blend),
         }
     }
 
@@ -1061,6 +1124,8 @@ impl Context {
             GraphicsBackend::OpenGL(ctx) => ctx.set_stencil(stencil_test),
             #[cfg(feature = "vulkan")]
             GraphicsBackend::Vulkan(ctx) => ctx.set_stencil(stencil_test),
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(ctx) => ctx.set_stencil(stencil_test),
         }
     }
 
@@ -1069,6 +1134,8 @@ impl Context {
             GraphicsBackend::OpenGL(ctx) => ctx.apply_viewport(x, y, w, h),
             #[cfg(feature = "vulkan")]
             GraphicsBackend::Vulkan(ctx) => ctx.apply_viewport(x, y, w, h),
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(ctx) => ctx.apply_viewport(x, y, w, h),
         }
     }
 
@@ -1077,6 +1144,8 @@ impl Context {
             GraphicsBackend::OpenGL(ctx) => ctx.apply_scissor_rect(x, y, w, h),
             #[cfg(feature = "vulkan")]
             GraphicsBackend::Vulkan(ctx) => ctx.apply_scissor_rect(x, y, w, h),
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(ctx) => ctx.apply_scissor_rect(x, y, w, h),
         }
     }
 
@@ -1085,6 +1154,8 @@ impl Context {
             GraphicsBackend::OpenGL(ctx) => ctx.apply_bindings(bindings),
             #[cfg(feature = "vulkan")]
             GraphicsBackend::Vulkan(ctx) => ctx.apply_bindings(bindings),
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(ctx) => ctx.apply_bindings(bindings),
         }
     }
 
@@ -1098,6 +1169,8 @@ impl Context {
             GraphicsBackend::OpenGL(ctx) => ctx.apply_uniforms_from_bytes(uniform_ptr, size),
             #[cfg(feature = "vulkan")]
             GraphicsBackend::Vulkan(ctx) => ctx.apply_uniforms_from_bytes(uniform_ptr, size),
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(ctx) => ctx.apply_uniforms_from_bytes(uniform_ptr, size),
         }
     }
 
@@ -1111,6 +1184,8 @@ impl Context {
             GraphicsBackend::OpenGL(ctx) => ctx.clear(color, depth, stencil),
             #[cfg(feature = "vulkan")]
             GraphicsBackend::Vulkan(ctx) => ctx.clear(color, depth, stencil),
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(ctx) => ctx.clear(color, depth, stencil),
         }
     }
 
@@ -1125,6 +1200,8 @@ impl Context {
             GraphicsBackend::OpenGL(ctx) => ctx.begin_pass(pass.into(), action),
             #[cfg(feature = "vulkan")]
             GraphicsBackend::Vulkan(ctx) => ctx.begin_pass(pass.into(), action),
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(ctx) => ctx.begin_pass(pass.into(), action),
         }
     }
 
@@ -1133,6 +1210,8 @@ impl Context {
             GraphicsBackend::OpenGL(ctx) => ctx.end_render_pass(),
             #[cfg(feature = "vulkan")]
             GraphicsBackend::Vulkan(ctx) => ctx.end_render_pass(),
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(ctx) => ctx.end_render_pass(),
         }
     }
 
@@ -1141,6 +1220,8 @@ impl Context {
             GraphicsBackend::OpenGL(ctx) => ctx.commit_frame(),
             #[cfg(feature = "vulkan")]
             GraphicsBackend::Vulkan(ctx) => ctx.commit_frame(),
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(ctx) => ctx.commit_frame(),
         }
     }
 
@@ -1149,6 +1230,8 @@ impl Context {
             GraphicsBackend::OpenGL(ctx) => ctx.draw(base_element, num_elements, num_instances),
             #[cfg(feature = "vulkan")]
             GraphicsBackend::Vulkan(ctx) => ctx.draw(base_element, num_elements, num_instances),
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(ctx) => ctx.draw(base_element, num_elements, num_instances),
         }
     }
 
@@ -1184,6 +1267,18 @@ impl Context {
             },
             #[cfg(feature = "vulkan")]
             GraphicsBackend::Vulkan(ctx) => {
+                let src = ctx.passes[src.0]
+                    .as_ref()
+                    .expect("the render pass has been deleted")
+                    .color;
+                let dst = ctx.passes[dst.0]
+                    .as_ref()
+                    .expect("the render pass has been deleted")
+                    .color;
+                ctx.copy_texture(src.texture as usize, dst.texture as usize)
+            }
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(ctx) => {
                 let src = ctx.passes[src.0]
                     .as_ref()
                     .expect("the render pass has been deleted")
@@ -2102,6 +2197,10 @@ pub fn with_params(
             GraphicsBackend::Vulkan(_) => ctx
                 .vulkan()
                 .new_pipeline(buffer_layout, attributes, shader, params),
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(_) => ctx
+                .metal()
+                .new_pipeline(buffer_layout, attributes, shader, params),
         }
     }
 
@@ -2225,6 +2324,8 @@ pub fn with_params(
             }
             #[cfg(feature = "vulkan")]
             GraphicsBackend::Vulkan(_) => ctx.vulkan().pipelines[self.0].params.color_blend = color_blend,
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(_) => ctx.metal().pipelines[self.0].params.color_blend = color_blend,
         }
     }
 }
@@ -2335,6 +2436,13 @@ pub fn immutable<T>(ctx: &mut Context, buffer_type: BufferType, data: &[T]) -> B
                 size,
                 Some(data.as_ptr() as *const u8),
             ),
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(_) => ctx.metal().new_buffer(
+                buffer_type,
+                index_type,
+                size,
+                Some(data.as_ptr() as *const u8),
+            ),
         }
     }
 
@@ -2381,6 +2489,10 @@ pub fn immutable<T>(ctx: &mut Context, buffer_type: BufferType, data: &[T]) -> B
             GraphicsBackend::Vulkan(_) => {
                 ctx.vulkan().new_buffer(buffer_type, index_type, size, None)
             }
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(_) => {
+                ctx.metal().new_buffer(buffer_type, index_type, size, None)
+            }
         }
     }
 
@@ -2420,6 +2532,11 @@ pub fn immutable<T>(ctx: &mut Context, buffer_type: BufferType, data: &[T]) -> B
                 ctx.vulkan()
                     .new_buffer(BufferType::IndexBuffer, Some(index_type), size, None)
             }
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(_) => {
+                ctx.metal()
+                    .new_buffer(BufferType::IndexBuffer, Some(index_type), size, None)
+            }
         }
     }
 
@@ -2447,6 +2564,10 @@ pub fn immutable<T>(ctx: &mut Context, buffer_type: BufferType, data: &[T]) -> B
             GraphicsBackend::Vulkan(_) => ctx
                 .vulkan()
                 .update_buffer(self.gl_buf as usize, data.as_ptr() as *const u8, size),
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(_) => ctx
+                .metal()
+                .update_buffer(self.gl_buf as usize, data.as_ptr() as *const u8, size),
         }
     }
 
@@ -2466,6 +2587,8 @@ pub fn immutable<T>(ctx: &mut Context, buffer_type: BufferType, data: &[T]) -> B
             }
             #[cfg(feature = "vulkan")]
             GraphicsBackend::Vulkan(_) => ctx.vulkan().delete_buffer(self.gl_buf as usize),
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(_) => ctx.metal().delete_buffer(self.gl_buf as usize),
         }
     }
 }

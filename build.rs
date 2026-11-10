@@ -6,6 +6,11 @@ fn main() {
     if target.contains("darwin") {
         println!("cargo:rustc-link-lib=framework=OpenGL");
     }
+    if (target.contains("darwin") || target.contains("ios")) && env::var_os("CARGO_FEATURE_METAL").is_some() {
+        println!("cargo:rustc-link-lib=framework=Metal");
+        println!("cargo:rustc-link-lib=framework=QuartzCore");
+        println!("cargo:rustc-link-lib=framework=Foundation");
+    }
 
     if target.contains("ios") {
         println!("cargo:rustc-link-lib=framework=OpenGLES");

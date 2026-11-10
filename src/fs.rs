@@ -33,6 +33,11 @@ pub type Response = Result<Vec<u8>, Error>;
 
 /// Filesystem path on desktops or HTTP URL in WASM
 pub fn load_file<F: Fn(Response) + 'static>(path: &str, on_loaded: F) {
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    if std::path::Path::new(path).is_absolute() {
+        on_loaded(std::fs::read(path).map_err(Error::IOError));
+        return;
+    }
     #[cfg(target_arch = "wasm32")]
     wasm::load_file(path, on_loaded);
 

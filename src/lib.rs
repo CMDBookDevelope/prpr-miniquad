@@ -191,6 +191,12 @@ pub fn start<F>(conf: conf::Conf, f: F)
 where
     F: 'static + FnOnce(&mut Context) -> Box<dyn EventHandler>,
 {
+    #[cfg(feature = "metal")]
+    if conf.platform.rendering_backend == conf::RenderingBackend::Metal {
+        assert!(conf.headless, "Metal chart rendering uses an offscreen context");
+        native::offscreen::run(&conf, f);
+        return;
+    }
     #[cfg(target_env = "ohos")]
     unsafe {
         native::ohos::run(conf, f);
@@ -228,6 +234,11 @@ where
 
     #[cfg(target_os = "android")]
     unsafe {
+        if conf.headless {
+            let mut create = Some(f);
+            native::headless::run(&conf, &mut create).expect("Headless backend failed");
+            return;
+        }
         native::android::run(conf, f);
     }
 

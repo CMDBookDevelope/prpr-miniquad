@@ -56,6 +56,8 @@ pub trait NativeDisplay: std::any::Any {
 }
 
 pub mod module;
+#[cfg(any(feature = "vulkan", feature = "metal"))]
+pub mod offscreen;
 
 #[cfg(target_env = "ohos")]
 pub mod ohos;

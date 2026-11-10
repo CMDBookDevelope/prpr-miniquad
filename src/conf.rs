@@ -65,6 +65,8 @@ pub enum LinuxBackend {
 /// Rendering backend selection
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RenderingBackend {
+    /// Native Apple GPU rendering. The `metal` feature is required.
+    Metal,
     /// OpenGL backend (default)
     OpenGL,
     /// Vulkan backend (if available)

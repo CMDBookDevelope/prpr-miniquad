@@ -49,6 +49,8 @@ impl Texture {
             },
             #[cfg(feature = "vulkan")]
             GraphicsBackend::Vulkan(_) => ctx.vulkan().delete_texture(self.texture as usize),
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(_) => ctx.metal().delete_texture(self.texture as usize),
         }
     }
 }
@@ -194,6 +196,16 @@ impl Texture {
                 filter: params.filter,
                 mipmap_filter: params.mipmap_filter,
             },
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(_) => Texture {
+                texture: ctx.metal().new_texture(bytes, params, access) as GLuint,
+                width: params.width,
+                height: params.height,
+                format: params.format,
+                wrap: params.wrap,
+                filter: params.filter,
+                mipmap_filter: params.mipmap_filter,
+            },
         }
     }
 
@@ -300,6 +312,8 @@ impl Texture {
             }
             #[cfg(feature = "vulkan")]
             GraphicsBackend::Vulkan(_) => ctx.vulkan().set_texture_filter(self.texture as usize, filter),
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(_) => ctx.metal().set_texture_filter(self.texture as usize, filter),
         }
     }
 
@@ -316,6 +330,8 @@ impl Texture {
             }
             #[cfg(feature = "vulkan")]
             GraphicsBackend::Vulkan(_) => ctx.vulkan().set_texture_wrap(self.texture as usize, wrap),
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(_) => ctx.metal().set_texture_wrap(self.texture as usize, wrap),
         }
     }
 
@@ -328,6 +344,14 @@ impl Texture {
             GraphicsBackend::Vulkan(_) => {
                 let format = self.format;
                 ctx.vulkan()
+                    .resize_texture(self.texture as usize, width, height, format, bytes);
+                self.width = width;
+                self.height = height;
+            }
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(_) => {
+                let format = self.format;
+                ctx.metal()
                     .resize_texture(self.texture as usize, width, height, format, bytes);
                 self.width = width;
                 self.height = height;
@@ -431,6 +455,16 @@ impl Texture {
                 bytes,
                 self.format,
             ),
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(_) => ctx.metal().update_texture_part(
+                self.texture as usize,
+                x_offset,
+                y_offset,
+                width,
+                height,
+                bytes,
+                self.format,
+            ),
         }
     }
 
@@ -445,6 +479,10 @@ impl Texture {
             GraphicsBackend::Vulkan(_) => {
                 ctx.vulkan().generate_mipmap(self.texture as usize)
             }
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(_) => {
+                ctx.metal().generate_mipmap(self.texture as usize)
+            }
         }
     }
 
@@ -458,6 +496,8 @@ impl Texture {
             },
             #[cfg(feature = "vulkan")]
             GraphicsBackend::Vulkan(_) => ctx.vulkan().max_texture_size,
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(_) => ctx.metal().max_texture_size,
         }
     }
 
@@ -504,6 +544,14 @@ impl Texture {
             }
             #[cfg(feature = "vulkan")]
             GraphicsBackend::Vulkan(_) => ctx.vulkan().read_texture_pixels(
+                self.texture as usize,
+                self.width,
+                self.height,
+                self.format,
+                bytes,
+            ),
+            #[cfg(feature = "metal")]
+            GraphicsBackend::Metal(_) => ctx.metal().read_texture_pixels(
                 self.texture as usize,
                 self.width,
                 self.height,
