@@ -5,6 +5,37 @@ pub mod graphics;
 
 pub mod native;
 
+/// Backend diagnostics can share the application's logger without changing the
+/// default console output of applications that do not enable `log-bridge`.
+#[doc(hidden)]
+pub fn emit_diagnostic(level: u8, message: std::fmt::Arguments<'_>) {
+    #[cfg(feature = "log-bridge")]
+    {
+        let level = match level {
+            1 => log_rs::Level::Error,
+            2 => log_rs::Level::Warn,
+            3 => log_rs::Level::Info,
+            4 => log_rs::Level::Debug,
+            _ => log_rs::Level::Trace,
+        };
+        log_rs::log!(target: "miniquad", level, "{message}");
+    }
+    #[cfg(not(feature = "log-bridge"))]
+    if level <= 2 {
+        eprintln!("{message}");
+    } else {
+        println!("{message}");
+    }
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! diagnostic {
+    ($level:expr, $($arg:tt)*) => {
+        $crate::emit_diagnostic($level, format_args!($($arg)*))
+    };
+}
+
 #[cfg(target_env = "ohos")]
 use napi_derive_ohos::napi;
 
@@ -219,13 +250,13 @@ where
             }
             conf::LinuxBackend::X11WithWaylandFallback => {
                 if native::linux_x11::run(&conf, f).is_none() {
-                    println!("Failed to initialize through X11! Trying wayland instead");
+                    crate::diagnostic!(3, "Failed to initialize through X11! Trying wayland instead");
                     native::linux_wayland::run(&conf, f);
                 }
             }
             conf::LinuxBackend::WaylandWithX11Fallback => {
                 if native::linux_wayland::run(&conf, f).is_none() {
-                    println!("Failed to initialize through wayland! Trying X11 instead");
+                    crate::diagnostic!(3, "Failed to initialize through wayland! Trying X11 instead");
                     native::linux_x11::run(&conf, f);
                 }
             }

@@ -556,7 +556,7 @@ unsafe fn create_opengl_view(
     let mut glpixelformat_obj: ObjcId = std::ptr::null_mut();
 
     for profile in profiles_to_try {
-        println!(
+        crate::diagnostic!(3,
             "macOS: Trying OpenGL profile: {}",
             if profile == NSOpenGLPFAOpenGLProfiles::NSOpenGLProfileVersion4_1Core as _ {
                 "4.1 Core"
@@ -595,7 +595,7 @@ unsafe fn create_opengl_view(
         glpixelformat_obj = msg_send![glpixelformat_obj, initWithAttributes: attrs.as_ptr()];
 
         if !glpixelformat_obj.is_null() {
-            println!(
+            crate::diagnostic!(3,
                 "macOS: Successfully created OpenGL context with profile: {}",
                 if profile == NSOpenGLPFAOpenGLProfiles::NSOpenGLProfileVersion4_1Core as _ {
                     "4.1 Core"
@@ -605,7 +605,7 @@ unsafe fn create_opengl_view(
             );
             break;
         } else {
-            println!("macOS: Failed to create OpenGL context with profile: {}",
+            crate::diagnostic!(3, "macOS: Failed to create OpenGL context with profile: {}",
                 if profile == NSOpenGLPFAOpenGLProfiles::NSOpenGLProfileVersion4_1Core as _ {
                     "4.1 Core"
                 } else {

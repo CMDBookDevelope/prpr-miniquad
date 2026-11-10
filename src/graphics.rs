@@ -1773,8 +1773,8 @@ impl GraphicsContext {
         );
 
         if !self.features.instancing && num_instances != 1 {
-            println!("Instanced rendering is not supported by the GPU");
-            println!("Ignoring this draw call");
+            crate::diagnostic!(3, "Instanced rendering is not supported by the GPU");
+            crate::diagnostic!(3, "Ignoring this draw call");
             return;
         }
 

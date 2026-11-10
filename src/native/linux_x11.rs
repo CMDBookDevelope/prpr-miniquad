@@ -125,7 +125,7 @@ impl crate::native::NativeDisplay for X11Display {
     }
 
     fn set_window_size(&mut self, _new_width: u32, _new_height: u32) {
-        println!("set_window_size not implemented on linux/x11")
+        crate::diagnostic!(3, "set_window_size not implemented on linux/x11")
     }
 
     fn set_fullscreen(&mut self, fullscreen: bool) {
@@ -191,7 +191,7 @@ impl X11Display {
             mut _display: *mut Display,
             event: *mut XErrorEvent,
         ) -> libc::c_int {
-            println!("Error: {}", (*event).error_code);
+            crate::diagnostic!(3, "Error: {}", (*event).error_code);
             return 0 as libc::c_int;
         }
 

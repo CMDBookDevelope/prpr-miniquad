@@ -178,7 +178,23 @@ macro_rules! __log_line {
     };
 }
 
-#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+#[cfg(feature = "log-bridge")]
+pub fn __private_api_log_lit(
+    message: &str,
+    level: Level,
+    &(target, _module_path, _file, _line): &(&str, &'static str, &'static str, u32),
+) {
+    let level = match level {
+        Level::Error => log_rs::Level::Error,
+        Level::Warn => log_rs::Level::Warn,
+        Level::Info => log_rs::Level::Info,
+        Level::Debug => log_rs::Level::Debug,
+        Level::Trace => log_rs::Level::Trace,
+    };
+    log_rs::log!(target: target, level, "{message}");
+}
+
+#[cfg(all(not(feature = "log-bridge"), not(any(target_arch = "wasm32", target_os = "android"))))]
 pub fn __private_api_log_lit(
     message: &str,
     _level: Level,
@@ -187,7 +203,7 @@ pub fn __private_api_log_lit(
     eprintln!("{}", message);
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", not(feature = "log-bridge")))]
 pub fn __private_api_log_lit(
     message: &str,
     level: Level,
@@ -208,7 +224,7 @@ pub fn __private_api_log_lit(
     unsafe { log_fn(msg.as_ptr()) };
 }
 
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", not(feature = "log-bridge")))]
 pub fn __private_api_log_lit(
     message: &str,
     level: Level,

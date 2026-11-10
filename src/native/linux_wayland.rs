@@ -161,7 +161,7 @@ unsafe extern "C" fn registry_add_object(
     let display = &mut payload.display;
 
     let interface = std::ffi::CStr::from_ptr(interface).to_str().unwrap();
-    println!("{:?}", interface);
+    crate::diagnostic!(3, "{:?}", interface);
     match interface {
         "wl_compositor" => {
             display.compositor = display.client.wl_registry_bind(
@@ -332,7 +332,7 @@ where
 
         let wdisplay = (client.wl_display_connect)(std::ptr::null_mut());
         if wdisplay.is_null() {
-            println!("Failed to connect to Wayland payload.display.");
+            crate::diagnostic!(3, "Failed to connect to Wayland payload.display.");
             return None;
         }
 
@@ -388,7 +388,7 @@ where
         assert!(payload.display.seat.is_null() == false);
 
         if payload.display.decoration_manager.is_null() {
-            println!("Decoration manager not found, will draw fallback decorations");
+            crate::diagnostic!(3, "Decoration manager not found, will draw fallback decorations");
         }
 
         payload.display.surface = wl_request_constructor!(

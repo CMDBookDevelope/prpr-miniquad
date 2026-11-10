@@ -413,7 +413,7 @@ impl Wgl {
         let mut last_error = 0;
 
         for (major, minor) in versions_to_try {
-            println!("WGL: Trying to create OpenGL {}.{} context...", major, minor);
+            crate::diagnostic!(3, "WGL: Trying to create OpenGL {}.{} context...", major, minor);
 
             let attrs = [
                 WGL_CONTEXT_MAJOR_VERSION_ARB,
@@ -434,11 +434,11 @@ impl Wgl {
             );
 
             if !gl_ctx.is_null() {
-                println!("WGL: Successfully created OpenGL {}.{} context", major, minor);
+                crate::diagnostic!(3, "WGL: Successfully created OpenGL {}.{} context", major, minor);
                 break;
             } else {
                 last_error = GetLastError();
-                println!(
+                crate::diagnostic!(3,
                     "WGL: Failed to create OpenGL {}.{} context (error: 0x{:08X})",
                     major, minor, last_error
                 );

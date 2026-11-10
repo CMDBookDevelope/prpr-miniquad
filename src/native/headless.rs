@@ -78,7 +78,7 @@ unsafe fn create_pbuffer_context(
     if display.is_null() {
         if let Some(get_error) = egl.eglGetError {
             let err = get_error();
-            eprintln!("eglGetDisplay failed, error: 0x{:x}", err);
+            crate::diagnostic!(2, "eglGetDisplay failed, error: 0x{:x}", err);
         }
         return Err("eglGetDisplay failed".to_string());
     }
@@ -185,7 +185,7 @@ where
         ) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("Headless EGL initialization error: {}", e);
+                crate::diagnostic!(2, "Headless EGL initialization error: {}", e);
                 return None;
             }
         };
@@ -226,7 +226,7 @@ where
             let renderer = std::ffi::CStr::from_ptr(gl::glGetString(gl::GL_RENDERER) as *const _)
                 .to_str()
                 .unwrap();
-            eprintln!("OpenGL Renderer: {}", renderer);
+            crate::diagnostic!(2, "OpenGL Renderer: {}", renderer);
         }
 
         // Main loop

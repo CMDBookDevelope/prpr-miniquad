@@ -753,7 +753,7 @@ impl Display {
             proc_ptr = GetProcAddress(self.libopengl32.module.0, proc.as_ptr());
         }
         if proc_ptr.is_null() {
-            println!("Load GL func {:?} failed.", proc);
+            crate::diagnostic!(3, "Load GL func {:?} failed.", proc);
             return None;
         }
         Some(std::mem::transmute(proc_ptr))
