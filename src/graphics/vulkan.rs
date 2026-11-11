@@ -81,7 +81,7 @@ pub struct UniformArena {
     pub retired: Vec<(vk::Buffer, vk::DeviceMemory)>,
 }
 
-/// Per-frame host visible arena the stream buffers are written into.
+/// Per-frame host visible arena for stream buffers and texture uploads.
 ///
 /// A frame's command buffer is recorded in full before it is submitted, so a
 /// buffer that is updated twice in one frame cannot keep a single copy: every
@@ -635,7 +635,9 @@ impl VulkanContext {
             for _ in 0..MAX_FRAMES_IN_FLIGHT {
                 let (buffer, memory) = self.create_buffer(
                     STREAM_ARENA_SIZE,
-                    vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::INDEX_BUFFER,
+                    vk::BufferUsageFlags::VERTEX_BUFFER
+                        | vk::BufferUsageFlags::INDEX_BUFFER
+                        | vk::BufferUsageFlags::TRANSFER_SRC,
                     vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
                 );
                 let mapped = self

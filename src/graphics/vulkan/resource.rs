@@ -632,14 +632,21 @@ impl VulkanContext {
     }
 
     pub(crate) fn append_stream(&mut self, data: *const u8, size: usize) -> (vk::Buffer, vk::DeviceSize) {
+        self.append_stream_aligned(data, size, 16)
+    }
+
+    fn append_stream_aligned(
+        &mut self,
+        data: *const u8,
+        size: usize,
+        alignment: vk::DeviceSize,
+    ) -> (vk::Buffer, vk::DeviceSize) {
         if size == 0 {
             return (self.stream_arenas[self.current_frame].buffer, 0);
         }
         unsafe {
             let slot = self.current_frame;
-            let alignment = 16;
-            let offset =
-                (self.stream_arenas[slot].offset + alignment - 1) & !(alignment - 1);
+            let offset = align_stream_offset(self.stream_arenas[slot].offset, alignment);
             if offset + size as vk::DeviceSize > self.stream_arenas[slot].capacity {
                 self.grow_stream_arena(slot, offset + size as vk::DeviceSize);
             }
@@ -659,7 +666,9 @@ impl VulkanContext {
             let used = self.stream_arenas[slot].offset;
             let (buffer, memory) = self.create_buffer(
                 capacity,
-                vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::INDEX_BUFFER,
+                vk::BufferUsageFlags::VERTEX_BUFFER
+                    | vk::BufferUsageFlags::INDEX_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_SRC,
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
             );
             let mapped = self
@@ -799,7 +808,11 @@ impl VulkanContext {
                 None => self.transition_texture(
                     index,
                     vk::ImageLayout::UNDEFINED,
-                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    if access == TextureAccess::RenderTarget {
+                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+                    } else {
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                    },
                 ),
             }
 
@@ -937,6 +950,10 @@ impl VulkanContext {
         format: TextureFormat,
         bytes: Option<&[u8]>,
     ) {
+        // A replacement upload can now be recorded asynchronously. Wait before
+        // destroying the old image rather than relying on that upload to drain
+        // commands which still reference its image/view/sampler.
+        self.synchronize_resources();
         let (access, filter, wrap, mipmap_filter) = {
             let module = &self.textures[index];
             (
@@ -1190,6 +1207,19 @@ impl VulkanContext {
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 from_layout,
             );
+            let host_read = vk::BufferMemoryBarrier::builder()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(staging)
+                .offset(0)
+                .size(pixel_len as vk::DeviceSize)
+                .build();
+            self.device.cmd_pipeline_barrier(
+                cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(), &[], &[host_read], &[],
+            );
             self.device
                 .end_command_buffer(cmd)
                 .expect("Failed to end the readback command buffer");
@@ -1283,19 +1313,7 @@ impl VulkanContext {
                 vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
             };
 
-            let (staging, staging_memory) = self.create_buffer(
-                bytes.len() as vk::DeviceSize,
-                vk::BufferUsageFlags::TRANSFER_SRC,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            );
-            let mapped = self
-                .device
-                .map_memory(staging_memory, 0, bytes.len() as vk::DeviceSize, vk::MemoryMapFlags::empty())
-                .expect("Failed to map the staging buffer");
-            ptr::copy_nonoverlapping(bytes.as_ptr(), mapped as *mut u8, bytes.len());
-            self.device.unmap_memory(staging_memory);
-
-            let region = vk::BufferImageCopy {
+            let mut region = vk::BufferImageCopy {
                 image_subresource: vk::ImageSubresourceLayers {
                     aspect_mask,
                     mip_level: 0,
@@ -1314,6 +1332,84 @@ impl VulkanContext {
                 },
                 ..Default::default()
             };
+
+            if self.frame_active && self.recording && !self.frame_submitted {
+                // Keep dynamic uploads in the same command stream as the draws
+                // that consume them. Submitting and waiting here serializes the
+                // entire frame ring, even for a four-byte texture update.
+                // Close/execute queued rendering first: transfer commands cannot
+                // run inside dynamic rendering, and the command recorder must
+                // not replay earlier draws after this copy.
+                let resume = self.pass_open;
+                let target = self.cur_target;
+                let viewport = self.viewport;
+                let scissor = self.scissor;
+                self.close_pass();
+                self.transition_sampled_textures();
+                self.flush_draw_commands();
+                // Buffer-image copies also require texel-block alignment. A
+                // static RGB8 texture is truly three-channel, unlike an RGB8
+                // render target backed by RGBA8; 16-byte alignment alone is
+                // therefore insufficient. Use lcm(16, 3) for that format.
+                let alignment = texture_upload_alignment(self.textures[index].format);
+                let (staging, offset) =
+                    self.append_stream_aligned(bytes.as_ptr(), bytes.len(), alignment);
+                region.buffer_offset = offset;
+                let cmd = self.command_buffers[self.acquired_image.unwrap()];
+                self.barrier(cmd, image, aspect_mask, self.textures[index].layout, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+                self.device.cmd_copy_buffer_to_image(
+                    cmd, staging, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region],
+                );
+                self.barrier(cmd, image, aspect_mask, vk::ImageLayout::TRANSFER_DST_OPTIMAL, final_layout);
+                self.textures[index].layout = final_layout;
+                self.cmd_dirty = true;
+                if resume {
+                    // The old scope stored (and possibly resolved) this target;
+                    // the resumed scope loads it. The layout stays unchanged,
+                    // so transition_attachments alone cannot provide the
+                    // required attachment write -> read/write dependency.
+                    let stages = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                        | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                        | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS;
+                    let writes = vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                        | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE;
+                    let barrier = vk::MemoryBarrier::builder()
+                        .src_access_mask(writes)
+                        .dst_access_mask(writes | vk::AccessFlags::COLOR_ATTACHMENT_READ
+                            | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ)
+                        .build();
+                    self.device.cmd_pipeline_barrier(
+                        cmd, stages, stages, vk::DependencyFlags::empty(),
+                        &[barrier], &[], &[],
+                    );
+                    // Updating a texture must not unbind the caller's target,
+                    // viewport, scissor or pending uniforms/samplers. In
+                    // particular, update -> draw needs no second begin_pass.
+                    let pending = std::mem::take(&mut self.pending);
+                    self.begin_pass(target.map(RenderPass), PassAction::Nothing);
+                    self.viewport = viewport;
+                    self.scissor = scissor;
+                    self.pending = pending;
+                }
+                // append_stream owns a distinct slice until this frame's fence
+                // completes, including when the arena grows or a texture is
+                // updated several times in one frame. No queue wait is needed.
+                return;
+            }
+
+            // Resource initialization outside a frame retains its synchronous
+            // semantics. There is no active frame fence to own staging storage.
+            let (staging, staging_memory) = self.create_buffer(
+                bytes.len() as vk::DeviceSize,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            );
+            let mapped = self
+                .device
+                .map_memory(staging_memory, 0, bytes.len() as vk::DeviceSize, vk::MemoryMapFlags::empty())
+                .expect("Failed to map the staging buffer");
+            ptr::copy_nonoverlapping(bytes.as_ptr(), mapped as *mut u8, bytes.len());
+            self.device.unmap_memory(staging_memory);
 
             self.record_submit(|ctx, cmd| {
                 ctx.barrier(
@@ -1679,6 +1775,20 @@ pub fn std140_layout(layout: &UniformBlockLayout) -> (Vec<(u32, u32, u32, u32, u
 // State translation
 // ---------------------------------------------------------------------
 
+fn align_stream_offset(offset: vk::DeviceSize, alignment: vk::DeviceSize) -> vk::DeviceSize {
+    // Texture uploads can require 48-byte alignment, so power-of-two masking
+    // cannot be used here.
+    offset.div_ceil(alignment) * alignment
+}
+
+fn texture_upload_alignment(format: vk::Format) -> vk::DeviceSize {
+    match format {
+        vk::Format::R8G8B8_UNORM => 48,
+        // Other supported texture formats have one-, two- or four-byte blocks.
+        _ => 16,
+    }
+}
+
 pub fn vk_format(format: TextureFormat) -> vk::Format {
     match format {
         TextureFormat::RGB8 => vk::Format::R8G8B8_UNORM,
@@ -1696,6 +1806,49 @@ pub fn vk_texture_format(format: TextureFormat, access: TextureAccess) -> vk::Fo
     match (format, access) {
         (TextureFormat::RGB8, TextureAccess::RenderTarget) => vk::Format::R8G8B8A8_UNORM,
         _ => vk_format(format),
+    }
+}
+
+#[cfg(test)]
+mod stream_alignment_tests {
+    use super::*;
+
+    #[test]
+    fn rgb_upload_offsets_follow_mixed_arena_allocations() {
+        let uploads = [
+            (vk::Format::R8G8B8A8_UNORM, 4, 0),
+            (vk::Format::R8G8B8_UNORM, 6, 48),
+            (vk::Format::R8G8B8_UNORM, 6, 96),
+            (vk::Format::R8G8B8A8_UNORM, 4, 112),
+        ];
+        let mut used = 0;
+        for (format, size, expected_offset) in uploads {
+            let offset = align_stream_offset(used, texture_upload_alignment(format));
+            assert_eq!(offset, expected_offset);
+            assert!(offset >= used, "uploads must not overlap");
+            assert_eq!(offset % 16, 0);
+            if format == vk::Format::R8G8B8_UNORM {
+                assert_eq!(offset % 3, 0, "RGB copies require three-byte blocks");
+            }
+            used = offset + size;
+        }
+    }
+
+    #[test]
+    fn upload_alignment_follows_storage_format_and_accepts_non_power_of_two() {
+        assert_eq!(
+            texture_upload_alignment(vk_texture_format(TextureFormat::RGB8, TextureAccess::Static)),
+            48,
+        );
+        for format in [TextureFormat::RGB8, TextureFormat::RGBA8, TextureFormat::Alpha,
+            TextureFormat::LuminanceAlpha, TextureFormat::Depth] {
+            assert_eq!(texture_upload_alignment(vk_texture_format(format, TextureAccess::RenderTarget)), 16);
+        }
+        for used in 0..192 {
+            let offset = align_stream_offset(used, 48);
+            assert_eq!(offset % 48, 0);
+            assert!(offset >= used && offset - used < 48);
+        }
     }
 }
 

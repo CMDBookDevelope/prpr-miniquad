@@ -732,13 +732,25 @@ impl VulkanContext {
                 staging,
                 &[uv_region],
             );
+            // The frame fence orders completion, while this dependency makes
+            // the transfer writes visible to the CPU that consumes the mapped
+            // NV12 bytes. HOST_COHERENT removes the need for invalidate only.
+            let host_read = vk::BufferMemoryBarrier::builder()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(staging)
+                .offset(0)
+                .size(width as u64 * height as u64 * 3 / 2)
+                .build();
             self.device.cmd_pipeline_barrier(
                 command_buffer,
                 vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST,
                 vk::DependencyFlags::empty(),
                 &[],
-                &[],
+                &[host_read],
                 &[back_to_attachment(y, y_layout), back_to_attachment(uv, uv_layout)],
             );
         }
@@ -970,7 +982,7 @@ impl VulkanContext {
     /// instance stays open until a `begin_pass` needs a different target.
     pub fn end_render_pass(&mut self) {}
 
-    fn close_pass(&mut self) {
+    pub(super) fn close_pass(&mut self) {
         if !self.pass_open {
             return;
         }
@@ -1206,7 +1218,7 @@ impl VulkanContext {
     ///
     /// Recorded after `cmdEndRendering` because Vulkan rejects image barriers
     /// inside a dynamic rendering instance.
-    fn transition_sampled_textures(&mut self) {
+    pub(super) fn transition_sampled_textures(&mut self) {
         let command_buffer = self.command_buffers[self.acquired_image.unwrap()];
         for index in std::mem::take(&mut self.pending.sampled) {
             let (image, from, aspect_mask) = {
