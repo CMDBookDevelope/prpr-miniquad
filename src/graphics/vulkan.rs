@@ -480,7 +480,7 @@ impl VulkanContext {
             let properties = instance.get_physical_device_properties(physical_device);
             if surface.is_none() && std::env::var_os("MINIQUAD_VULKAN_VERBOSE").is_some() {
                 let name = CStr::from_ptr(properties.device_name.as_ptr()).to_string_lossy();
-                crate::diagnostic!(2, "[miniquad] headless Vulkan device: {name}");
+                crate::diagnostic!(4, "[miniquad] headless Vulkan device: {name}");
             }
             let max_texture_size = properties.limits.max_image_dimension2_d;
             let uniform_alignment = properties.limits.min_uniform_buffer_offset_alignment;

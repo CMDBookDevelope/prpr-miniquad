@@ -226,7 +226,7 @@ where
             let renderer = std::ffi::CStr::from_ptr(gl::glGetString(gl::GL_RENDERER) as *const _)
                 .to_str()
                 .unwrap();
-            crate::diagnostic!(2, "OpenGL Renderer: {}", renderer);
+            crate::diagnostic!(4, "OpenGL Renderer: {}", renderer);
         }
 
         // Main loop
