@@ -24,6 +24,8 @@ headless = []
 # Vulkan backend support
 vulkan = ["ash", "ash-window", "gpu-allocator", "shaderc", "rayon"]
 metal = ["metal-rs", "metal-shaders"]
+# Compile the previous draw allocation path only for native before/after runs.
+metal-bench = ["metal"]
 # Test the GLSL/MSL translator on hosts without the Apple Objective-C runtime.
 metal-shaders = ["spirv-cross2", "shaderc"]
 

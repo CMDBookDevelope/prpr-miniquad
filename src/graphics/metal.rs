@@ -1,8 +1,92 @@
 //! Native Metal resources using the fork's existing Texture/Buffer handles.
 //! An offscreen context never creates UIKit/AppKit windows; Tauri owns the UI.
 use super::*;
+use m::foreign_types::ForeignTypeRef;
 use metal_rs as m;
-use std::{collections::HashMap, ffi::c_void};
+use std::{
+    collections::{HashMap, VecDeque},
+    ffi::{c_void, CStr},
+};
+
+const MAX_IN_FLIGHT: usize = 3;
+const MAX_BUFFER_POOL_BYTES: u64 = 64 * 1024 * 1024;
+
+/// A retained GPU command. Keep external texture/pixel-buffer leases alive
+/// until this token completes, then hand the pixel buffer to the video encoder.
+pub struct MetalSubmission {
+    command: m::CommandBuffer,
+}
+
+impl MetalSubmission {
+    pub fn is_complete(&self) -> bool {
+        matches!(
+            self.command.status(),
+            m::MTLCommandBufferStatus::Completed | m::MTLCommandBufferStatus::Error
+        )
+    }
+
+    pub fn wait(&self) -> Result<(), String> {
+        self.command.wait_until_completed();
+        command_result(&self.command)
+    }
+}
+
+#[allow(unexpected_cfgs)] // objc 0.2 macros reference their historical cargo-clippy feature.
+fn command_result(command: &m::CommandBufferRef) -> Result<(), String> {
+    if command.status() != m::MTLCommandBufferStatus::Error {
+        return Ok(());
+    }
+    // metal-rs exposes command status but not the command's NSError.
+    use m::objc::{msg_send, runtime::Object, sel, sel_impl};
+    unsafe {
+        let error: *mut Object = msg_send![command, error];
+        if error.is_null() {
+            return Err("Metal command buffer failed without an NSError".into());
+        }
+        let description: *mut Object = msg_send![error, description];
+        let utf8: *const std::os::raw::c_char = msg_send![description, UTF8String];
+        Err(if utf8.is_null() {
+            "Metal command buffer failed".into()
+        } else {
+            format!(
+                "Metal command buffer failed: {}",
+                CStr::from_ptr(utf8).to_string_lossy()
+            )
+        })
+    }
+}
+
+struct SubmittedBatch {
+    command: m::CommandBuffer,
+    buffers: Vec<m::Buffer>,
+}
+
+struct MetalBuffer {
+    image: m::Buffer,
+    initialized: usize,
+    capacity: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+#[cfg(feature = "metal-bench")]
+pub struct MetalBenchStats {
+    pub buffers_created: u64,
+    pub buffers_reused: u64,
+    pub buffer_bytes_copied: u64,
+    pub uniform_buffers: u64,
+    pub inline_uniforms: u64,
+    pub depth_states: u64,
+    pub samplers: u64,
+    pub pipeline_states: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct DepthKey {
+    comparison: u8,
+    write: bool,
+    front: Option<[u32; 6]>,
+    back: Option<[u32; 6]>,
+}
 
 pub struct MetalPass {
     pub color: Texture,
@@ -24,7 +108,7 @@ pub struct MetalPipeline {
     pub params: PipelineParams,
     shader: usize,
     vertices: m::VertexDescriptor,
-    variants: HashMap<(u64, bool), m::RenderPipelineState>,
+    variants: HashMap<(u64, bool, [u8; 9]), m::RenderPipelineState>,
 }
 
 pub struct MetalContext {
@@ -33,7 +117,7 @@ pub struct MetalContext {
     command: Option<m::CommandBuffer>,
     encoder: Option<m::RenderCommandEncoder>,
     textures: Vec<Option<MetalTexture>>,
-    buffers: Vec<Option<m::Buffer>>,
+    buffers: Vec<Option<MetalBuffer>>,
     shaders: Vec<MetalShader>,
     pub pipelines: Vec<MetalPipeline>,
     pub passes: Vec<Option<MetalPass>>,
@@ -44,11 +128,26 @@ pub struct MetalContext {
     // Retain each buffer snapshot until the GPU finishes. A streaming buffer
     // may be updated multiple times in a frame; previous draws need old data.
     transient: Vec<m::Buffer>,
+    submitted: VecDeque<SubmittedBatch>,
+    buffer_pool: HashMap<u64, Vec<m::Buffer>>,
+    buffer_pool_bytes: u64,
+    uniform_bytes: Vec<u8>,
+    depth_states: HashMap<DepthKey, m::DepthStencilState>,
+    samplers: HashMap<(u8, u8, u8), m::SamplerState>,
     pub max_texture_size: u32,
     scale_pipeline: Option<m::RenderPipelineState>,
+    export_pipelines: HashMap<u64, m::RenderPipelineState>,
+    #[cfg(feature = "metal-bench")]
+    legacy_draw: bool,
+    #[cfg(feature = "metal-bench")]
+    bench_stats: MetalBenchStats,
 }
 
 impl MetalContext {
+    /// Borrowed Objective-C MTLDevice pointer, valid for this context's lifetime.
+    pub fn native_device(&self) -> *mut c_void {
+        self.device.as_ptr() as *mut c_void
+    }
     pub fn gpu_info() -> Option<(String, Vec<u32>)> {
         let device = m::Device::system_default()?;
         let counts = [1, 2, 4, 8, 16, 32, 64]
@@ -76,8 +175,19 @@ impl MetalContext {
             pipeline: None,
             index: None,
             transient: Vec::new(),
+            submitted: VecDeque::new(),
+            buffer_pool: HashMap::new(),
+            buffer_pool_bytes: 0,
+            uniform_bytes: Vec::new(),
+            depth_states: HashMap::new(),
+            samplers: HashMap::new(),
             max_texture_size: 16384,
             scale_pipeline: None,
+            export_pipelines: HashMap::new(),
+            #[cfg(feature = "metal-bench")]
+            legacy_draw: std::env::var("MINIQUAD_METAL_LEGACY_DRAW").is_ok_and(|v| v == "1"),
+            #[cfg(feature = "metal-bench")]
+            bench_stats: MetalBenchStats::default(),
         };
         // Macroquad binds Texture::empty() for unused sampler slots. Keep a
         // valid white fallback at handle zero, as the other backends do.
@@ -119,17 +229,86 @@ impl MetalContext {
         }
         self.command.as_ref().unwrap()
     }
-    pub fn finish(&mut self) {
+    fn recycle_buffers(&mut self, buffers: Vec<m::Buffer>) {
+        #[cfg(feature = "metal-bench")]
+        if self.legacy_draw {
+            return;
+        }
+        for buffer in buffers {
+            let length = buffer.length();
+            if self.buffer_pool_bytes + length <= MAX_BUFFER_POOL_BYTES {
+                self.buffer_pool.entry(length).or_default().push(buffer);
+                self.buffer_pool_bytes += length;
+            }
+        }
+    }
+    fn collect_completed(&mut self) -> Result<(), String> {
+        while self.submitted.front().is_some_and(|batch| {
+            matches!(
+                batch.command.status(),
+                m::MTLCommandBufferStatus::Completed | m::MTLCommandBufferStatus::Error
+            )
+        }) {
+            let batch = self.submitted.pop_front().unwrap();
+            let result = command_result(&batch.command);
+            self.recycle_buffers(batch.buffers);
+            result?;
+        }
+        Ok(())
+    }
+    /// Commit without waiting for this command. Queue order preserves render
+    /// target reuse; resources are recycled only after GPU completion.
+    pub fn submit(&mut self) -> Result<MetalSubmission, String> {
+        self.end_render_pass();
+        self.collect_completed()?;
+        if self.submitted.len() >= MAX_IN_FLIGHT {
+            let batch = self.submitted.pop_front().unwrap();
+            batch.command.wait_until_completed();
+            let result = command_result(&batch.command);
+            self.recycle_buffers(batch.buffers);
+            result?;
+        }
+        self.command();
+        let command = self.command.take().unwrap();
+        command.commit();
+        self.submitted.push_back(SubmittedBatch {
+            command: command.clone(),
+            buffers: std::mem::take(&mut self.transient),
+        });
+        Ok(MetalSubmission { command })
+    }
+    fn drain(&mut self) -> Result<(), String> {
         self.end_render_pass();
         if let Some(command) = self.command.take() {
             command.commit();
-            command.wait_until_completed();
-            assert!(
-                command.status() != m::MTLCommandBufferStatus::Error,
-                "Metal command buffer failed"
-            );
+            self.submitted.push_back(SubmittedBatch {
+                command,
+                buffers: std::mem::take(&mut self.transient),
+            });
         }
-        self.transient.clear();
+        let mut error = None;
+        // Even a failed command must not leave later work/resources in flight.
+        while let Some(batch) = self.submitted.pop_front() {
+            batch.command.wait_until_completed();
+            if let Err(reason) = command_result(&batch.command) {
+                error.get_or_insert(reason);
+            }
+            self.recycle_buffers(batch.buffers);
+        }
+        let unused = std::mem::take(&mut self.transient);
+        self.recycle_buffers(unused);
+        error.map_or(Ok(()), Err)
+    }
+    pub fn finish(&mut self) {
+        self.drain().expect("Metal GPU completion failed");
+    }
+    #[cfg(feature = "metal-bench")]
+    pub fn bench_stats(&self) -> MetalBenchStats {
+        self.bench_stats
+    }
+    #[cfg(feature = "metal-bench")]
+    pub fn reset_bench_stats(&mut self) {
+        self.bench_stats = MetalBenchStats::default();
     }
     pub fn new_shader(
         &mut self,
@@ -207,7 +386,12 @@ impl MetalContext {
         let shader = &self.shaders[entry.shader];
         let params = entry.params;
         let vertices = &entry.vertices;
-        let state = entry.variants.entry((samples, depth)).or_insert_with(|| {
+        let key = (samples, depth, render_key(params));
+        #[cfg(feature = "metal-bench")]
+        if !entry.variants.contains_key(&key) {
+            self.bench_stats.pipeline_states += 1;
+        }
+        let state = entry.variants.entry(key).or_insert_with(|| {
             let desc = m::RenderPipelineDescriptor::new();
             desc.set_vertex_function(Some(&shader.vertex));
             desc.set_fragment_function(Some(&shader.fragment));
@@ -239,20 +423,39 @@ impl MetalContext {
             .as_ref()
             .expect("draw outside Metal render pass");
         encoder.set_render_pipeline_state(state);
-        let depth_desc = m::DepthStencilDescriptor::new();
-        depth_desc.set_depth_compare_function(comparison(entry.params.depth_test));
-        depth_desc.set_depth_write_enabled(entry.params.depth_write);
-        if let Some(stencil) = entry.params.stencil_test {
-            depth_desc.set_front_face_stencil(Some(&stencil_face(stencil.front)));
-            depth_desc.set_back_face_stencil(Some(&stencil_face(stencil.back)));
+        let key = depth_key(params);
+        #[cfg(feature = "metal-bench")]
+        if self.legacy_draw {
+            // The old state allocation exists only in the benchmark binary.
+            let state = create_depth_state(&self.device, params);
+            self.bench_stats.depth_states += 1;
+            encoder.set_depth_stencil_state(&state);
+        } else {
+            if !self.depth_states.contains_key(&key) {
+                self.bench_stats.depth_states += 1;
+            }
+            let state = self
+                .depth_states
+                .entry(key)
+                .or_insert_with(|| create_depth_state(device, params));
+            encoder.set_depth_stencil_state(state);
+        }
+        #[cfg(not(feature = "metal-bench"))]
+        {
+            let state = self
+                .depth_states
+                .entry(key)
+                .or_insert_with(|| create_depth_state(device, params));
+            encoder.set_depth_stencil_state(state);
+        }
+        if let Some(stencil) = params.stencil_test {
             encoder.set_stencil_front_back_reference_value(
                 stencil.front.test_ref as u32,
                 stencil.back.test_ref as u32,
             );
         }
-        encoder.set_depth_stencil_state(&self.device.new_depth_stencil_state(&depth_desc));
-        encoder.set_cull_mode(cull(entry.params.cull_face));
-        encoder.set_front_facing_winding(match entry.params.front_face_order {
+        encoder.set_cull_mode(cull(params.cull_face));
+        encoder.set_front_facing_winding(match params.front_face_order {
             FrontFaceOrder::Clockwise => m::MTLWinding::Clockwise,
             FrontFaceOrder::CounterClockwise => m::MTLWinding::CounterClockwise,
         });
@@ -276,8 +479,17 @@ impl MetalContext {
     }
     fn modify_pipeline(&mut self, f: impl FnOnce(&mut PipelineParams)) {
         if let Some(index) = self.pipeline {
+            let before = self.pipelines[index].params;
             f(&mut self.pipelines[index].params);
-            self.pipelines[index].variants.clear();
+            #[cfg(feature = "metal-bench")]
+            if self.legacy_draw {
+                self.pipelines[index].variants.clear();
+                self.apply_pipeline(&Pipeline(index));
+                return;
+            }
+            if before == self.pipelines[index].params {
+                return;
+            }
             self.apply_pipeline(&Pipeline(index));
         }
     }
@@ -315,7 +527,9 @@ impl MetalContext {
         for (index, buffer) in bindings.vertex_buffers.iter().enumerate() {
             e.set_vertex_buffer(
                 index as u64 + 1,
-                self.buffers[buffer.gl_buf as usize].as_deref(),
+                self.buffers[buffer.gl_buf as usize]
+                    .as_ref()
+                    .map(|b| b.image.as_ref()),
                 0,
             );
         }
@@ -335,17 +549,54 @@ impl MetalContext {
         if layout.uniforms.is_empty() {
             return;
         }
-        let bytes =
-            super::metal_shader::pack(layout, unsafe { std::slice::from_raw_parts(ptr, size) });
+        #[cfg(feature = "metal-bench")]
+        if self.legacy_draw {
+            let bytes =
+                super::metal_shader::pack(layout, unsafe { std::slice::from_raw_parts(ptr, size) });
+            let buffer = self.device.new_buffer_with_data(
+                bytes.as_ptr() as _,
+                bytes.len() as u64,
+                m::MTLResourceOptions::StorageModeShared,
+            );
+            let encoder = self.encoder.as_ref().unwrap();
+            encoder.set_vertex_buffer(0, Some(&buffer), 0);
+            encoder.set_fragment_buffer(0, Some(&buffer), 0);
+            self.transient.push(buffer);
+            self.bench_stats.uniform_buffers += 1;
+            self.bench_stats.buffers_created += 1;
+            return;
+        }
+        super::metal_shader::pack_into(
+            layout,
+            unsafe { std::slice::from_raw_parts(ptr, size) },
+            &mut self.uniform_bytes,
+        );
+        let bytes = &self.uniform_bytes;
+        let e = self.encoder.as_ref().unwrap();
+        if bytes.len() <= 4096 {
+            // Metal copies these bytes at encoding time, preserving uniforms
+            // of earlier draws without a per-draw MTLBuffer allocation.
+            e.set_vertex_bytes(0, bytes.len() as u64, bytes.as_ptr() as _);
+            e.set_fragment_bytes(0, bytes.len() as u64, bytes.as_ptr() as _);
+            #[cfg(feature = "metal-bench")]
+            {
+                self.bench_stats.inline_uniforms += 1;
+            }
+            return;
+        }
         let buffer = self.device.new_buffer_with_data(
             bytes.as_ptr() as *const c_void,
             bytes.len() as u64,
             m::MTLResourceOptions::StorageModeShared,
         );
-        let e = self.encoder.as_ref().unwrap();
         e.set_vertex_buffer(0, Some(&buffer), 0);
         e.set_fragment_buffer(0, Some(&buffer), 0);
         self.transient.push(buffer);
+        #[cfg(feature = "metal-bench")]
+        {
+            self.bench_stats.uniform_buffers += 1;
+            self.bench_stats.buffers_created += 1;
+        }
     }
     pub fn new_buffer(
         &mut self,
@@ -364,7 +615,15 @@ impl MetalContext {
                 .device
                 .new_buffer(size as u64, m::MTLResourceOptions::StorageModeShared),
         };
-        self.buffers.push(Some(buffer));
+        self.buffers.push(Some(MetalBuffer {
+            image: buffer,
+            initialized: if ptr.is_some() { size } else { 0 },
+            capacity: size,
+        }));
+        #[cfg(feature = "metal-bench")]
+        {
+            self.bench_stats.buffers_created += 1;
+        }
         Buffer {
             gl_buf: (self.buffers.len() - 1) as u32,
             buffer_type: kind,
@@ -374,23 +633,89 @@ impl MetalContext {
     }
     pub fn update_buffer(&mut self, index: usize, ptr: *const u8, size: usize) {
         let previous = self.buffers[index].as_ref().unwrap();
-        let next = self
-            .device
-            .new_buffer(previous.length(), m::MTLResourceOptions::StorageModeShared);
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                previous.contents() as *const u8,
-                next.contents() as *mut u8,
-                previous.length() as usize,
+        assert!(
+            size <= previous.capacity,
+            "Metal buffer update exceeds capacity"
+        );
+        #[cfg(feature = "metal-bench")]
+        if self.legacy_draw {
+            let next = self.device.new_buffer(
+                previous.image.length(),
+                m::MTLResourceOptions::StorageModeShared,
             );
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    previous.image.contents() as *const u8,
+                    next.contents() as *mut u8,
+                    previous.image.length() as usize,
+                );
+                std::ptr::copy_nonoverlapping(ptr, next.contents() as *mut u8, size);
+            }
+            self.bench_stats.buffers_created += 1;
+            self.bench_stats.buffer_bytes_copied += previous.image.length() + size as u64;
+            let initialized = previous.initialized.max(size);
+            let capacity = previous.capacity;
+            let old = self.buffers[index]
+                .replace(MetalBuffer {
+                    image: next,
+                    initialized,
+                    capacity,
+                })
+                .unwrap();
+            self.transient.push(old.image);
+            return;
+        }
+        let initialized = previous.initialized.max(size);
+        let capacity = previous.capacity;
+        // Uninitialized stream capacity has no data to preserve. Size backing
+        // snapshots for their live data, retaining a defined suffix on partial
+        // updates, rather than allocating/copying the declared maximum.
+        let length = initialized
+            .max(1)
+            .checked_next_power_of_two()
+            .unwrap_or(capacity)
+            .min(capacity.max(1)) as u64;
+        let pooled = self.buffer_pool.get_mut(&length).and_then(Vec::pop);
+        #[cfg(feature = "metal-bench")]
+        if pooled.is_some() {
+            self.bench_stats.buffers_reused += 1;
+        } else {
+            self.bench_stats.buffers_created += 1;
+        }
+        let next = if let Some(buffer) = pooled {
+            self.buffer_pool_bytes -= length;
+            buffer
+        } else {
+            self.device
+                .new_buffer(length, m::MTLResourceOptions::StorageModeShared)
+        };
+        let suffix = previous.initialized.saturating_sub(size);
+        unsafe {
+            if suffix != 0 {
+                std::ptr::copy_nonoverlapping(
+                    (previous.image.contents() as *const u8).add(size),
+                    (next.contents() as *mut u8).add(size),
+                    suffix,
+                );
+            }
             std::ptr::copy_nonoverlapping(ptr, next.contents() as *mut u8, size);
         }
-        self.transient
-            .push(self.buffers[index].replace(next).unwrap());
+        #[cfg(feature = "metal-bench")]
+        {
+            self.bench_stats.buffer_bytes_copied += (size + suffix) as u64;
+        }
+        let old = self.buffers[index]
+            .replace(MetalBuffer {
+                image: next,
+                initialized,
+                capacity,
+            })
+            .unwrap();
+        self.transient.push(old.image);
     }
     pub fn delete_buffer(&mut self, index: usize) {
         if let Some(buffer) = self.buffers[index].take() {
-            self.transient.push(buffer);
+            self.transient.push(buffer.image);
         }
     }
     pub fn new_texture(
@@ -427,7 +752,7 @@ impl MetalContext {
         }));
         let index = self.textures.len() - 1;
         if let Some(bytes) = bytes {
-            self.update_texture_part(
+            self.upload_texture_part(
                 index,
                 0,
                 0,
@@ -439,31 +764,37 @@ impl MetalContext {
         }
         index
     }
-    fn sampler(&self, params: TextureParams) -> m::SamplerState {
-        let desc = m::SamplerDescriptor::new();
-        let filter = if params.filter == FilterMode::Nearest {
-            m::MTLSamplerMinMagFilter::Nearest
-        } else {
-            m::MTLSamplerMinMagFilter::Linear
-        };
-        desc.set_min_filter(filter);
-        desc.set_mag_filter(filter);
-        desc.set_mip_filter(match params.mipmap_filter {
-            MipmapFilter::None => m::MTLSamplerMipFilter::NotMipmapped,
-            MipmapFilter::Nearest => m::MTLSamplerMipFilter::Nearest,
-            MipmapFilter::Linear => m::MTLSamplerMipFilter::Linear,
-        });
-        let wrap = match params.wrap {
-            TextureWrap::Repeat => m::MTLSamplerAddressMode::Repeat,
-            TextureWrap::Mirror => m::MTLSamplerAddressMode::MirrorRepeat,
-            TextureWrap::Clamp => m::MTLSamplerAddressMode::ClampToEdge,
-        };
-        desc.set_address_mode_s(wrap);
-        desc.set_address_mode_t(wrap);
-        self.device.new_sampler(&desc)
+    fn sampler(&mut self, params: TextureParams) -> m::SamplerState {
+        #[cfg(feature = "metal-bench")]
+        if self.legacy_draw {
+            self.bench_stats.samplers += 1;
+            return create_sampler(&self.device, params);
+        }
+        let key = (
+            params.filter as u8,
+            params.wrap as u8,
+            params.mipmap_filter as u8,
+        );
+        #[cfg(feature = "metal-bench")]
+        if !self.samplers.contains_key(&key) {
+            self.bench_stats.samplers += 1;
+        }
+        let device = &self.device;
+        self.samplers
+            .entry(key)
+            .or_insert_with(|| create_sampler(device, params))
+            .clone()
     }
     pub fn set_texture_filter(&mut self, index: usize, filter: FilterMode) {
         let mut p = self.textures[index].as_ref().unwrap().params;
+        #[cfg(not(feature = "metal-bench"))]
+        if p.filter == filter {
+            return;
+        }
+        #[cfg(feature = "metal-bench")]
+        if !self.legacy_draw && p.filter == filter {
+            return;
+        }
         p.filter = filter;
         let sampler = self.sampler(p);
         let e = self.textures[index].as_mut().unwrap();
@@ -472,6 +803,14 @@ impl MetalContext {
     }
     pub fn set_texture_wrap(&mut self, index: usize, wrap: TextureWrap) {
         let mut p = self.textures[index].as_ref().unwrap().params;
+        #[cfg(not(feature = "metal-bench"))]
+        if p.wrap == wrap {
+            return;
+        }
+        #[cfg(feature = "metal-bench")]
+        if !self.legacy_draw && p.wrap == wrap {
+            return;
+        }
         p.wrap = wrap;
         let sampler = self.sampler(p);
         let e = self.textures[index].as_mut().unwrap();
@@ -486,7 +825,7 @@ impl MetalContext {
         _format: TextureFormat,
         bytes: Option<&[u8]>,
     ) {
-        self.finish();
+        self.end_render_pass();
         let mut p = self.textures[index].as_ref().unwrap().params;
         p.width = w;
         p.height = h;
@@ -504,17 +843,42 @@ impl MetalContext {
         format: TextureFormat,
     ) {
         self.finish(); // Texture updates must not race previous GPU readers.
-        let rgba: Vec<u8> = match format {
-            TextureFormat::RGBA8 => bytes.to_vec(),
-            TextureFormat::RGB8 => bytes
-                .chunks_exact(3)
-                .flat_map(|c| [c[0], c[1], c[2], 255])
-                .collect(),
-            TextureFormat::Alpha => bytes.iter().flat_map(|&a| [255, 255, 255, a]).collect(),
-            TextureFormat::LuminanceAlpha => bytes
-                .chunks_exact(2)
-                .flat_map(|c| [c[0], c[0], c[0], c[1]])
-                .collect(),
+        self.upload_texture_part(index, x, y, w, h, bytes, format);
+    }
+    fn upload_texture_part(
+        &mut self,
+        index: usize,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        bytes: &[u8],
+        format: TextureFormat,
+    ) {
+        let converted;
+        let rgba: &[u8] = match format {
+            TextureFormat::RGBA8 => bytes,
+            TextureFormat::RGB8 => {
+                converted = bytes
+                    .chunks_exact(3)
+                    .flat_map(|c| [c[0], c[1], c[2], 255])
+                    .collect::<Vec<_>>();
+                &converted
+            }
+            TextureFormat::Alpha => {
+                converted = bytes
+                    .iter()
+                    .flat_map(|&a| [255, 255, 255, a])
+                    .collect::<Vec<_>>();
+                &converted
+            }
+            TextureFormat::LuminanceAlpha => {
+                converted = bytes
+                    .chunks_exact(2)
+                    .flat_map(|c| [c[0], c[0], c[0], c[1]])
+                    .collect::<Vec<_>>();
+                &converted
+            }
             TextureFormat::Depth => panic!("CPU upload to a Metal depth attachment"),
         };
         self.image(index).replace_region(
@@ -533,6 +897,16 @@ impl MetalContext {
         bytes: &mut [u8],
     ) {
         self.finish();
+        assert_eq!(bytes.len(), format.size(w, h) as usize);
+        if format == TextureFormat::RGBA8 {
+            self.image(index).get_bytes(
+                bytes.as_mut_ptr() as _,
+                w as u64 * 4,
+                m::MTLRegion::new_2d(0, 0, w as u64, h as u64),
+                0,
+            );
+            return;
+        }
         let mut rgba = vec![0u8; w as usize * h as usize * 4];
         self.image(index).get_bytes(
             rgba.as_mut_ptr() as _,
@@ -540,7 +914,6 @@ impl MetalContext {
             m::MTLRegion::new_2d(0, 0, w as u64, h as u64),
             0,
         );
-        assert_eq!(bytes.len(), format.size(w, h) as usize);
         match format {
             TextureFormat::RGBA8 => bytes.copy_from_slice(&rgba),
             TextureFormat::RGB8 => {
@@ -577,7 +950,8 @@ impl MetalContext {
         );
     }
     pub fn delete_texture(&mut self, index: usize) {
-        self.finish();
+        // Commands retain their textures. Removing a handle does not mutate
+        // the backing image used by already encoded/submitted draws.
         self.textures[index].take();
     }
     pub fn generate_mipmap(&mut self, index: usize) {
@@ -640,6 +1014,7 @@ impl MetalContext {
     }
     pub fn begin_pass(&mut self, pass: Option<RenderPass>, action: PassAction) {
         self.end_render_pass();
+        self.collect_completed().expect("Metal GPU command failed");
         self.current_pass = pass.map(|p| p.0);
         let color = self.current_pass.map_or(self.default_color, |p| {
             self.passes[p].as_ref().unwrap().color
@@ -742,7 +1117,9 @@ impl MetalContext {
         }
     }
     pub fn commit_frame(&mut self) {
-        self.finish();
+        if self.command.is_some() {
+            self.submit().expect("Metal GPU submission failed");
+        }
     }
     pub fn draw(&mut self, base: i32, count: i32, instances: i32) {
         let index = self.index.unwrap();
@@ -762,7 +1139,7 @@ impl MetalContext {
                 primitive,
                 count as u64,
                 kind,
-                self.buffers[index.gl_buf as usize].as_ref().unwrap(),
+                &self.buffers[index.gl_buf as usize].as_ref().unwrap().image,
                 base as u64 * index.index_type.unwrap().size() as u64,
                 instances as u64,
             );
@@ -837,15 +1214,204 @@ fragment float4 resize_fragment(Varying in [[stage_in]], texture2d<float> image 
         );
         e.end_encoding();
     }
+    /// Render the resolved source directly into an external Metal texture.
+    /// BGRA attachments store logical RGBA fragment output in BGRA order.
+    ///
+    /// # Safety
+    /// `destination` must be a valid, live MTLTexture Objective-C pointer. The
+    /// external texture and its CoreVideo backing lease must remain alive until
+    /// the subsequent `submit()` token completes. Callers must not mutate its
+    /// backing storage while the GPU is using it.
+    pub unsafe fn copy_to_native_texture(
+        &mut self,
+        source: Texture,
+        destination: *mut c_void,
+        flip_y: bool,
+    ) -> Result<(), String> {
+        if destination.is_null() {
+            return Err("Metal export destination is null".into());
+        }
+        let src = self
+            .textures
+            .get(source.texture as usize)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| "Metal export source is deleted or invalid".to_owned())?
+            .image
+            .clone();
+        let dst = m::TextureRef::from_ptr(destination as *mut m::MTLTexture);
+        if src.device().as_ptr() != dst.device().as_ptr() {
+            return Err("Metal export textures belong to different devices".into());
+        }
+        if src.as_ptr() == dst.as_ptr() {
+            return Err("Metal export cannot read and write the same texture".into());
+        }
+        if (src.width(), src.height()) != (dst.width(), dst.height()) {
+            return Err(format!(
+                "Metal export size mismatch: source {}x{}, destination {}x{}",
+                src.width(),
+                src.height(),
+                dst.width(),
+                dst.height()
+            ));
+        }
+        if dst.texture_type() != m::MTLTextureType::D2 || dst.sample_count() != 1 {
+            return Err("Metal export requires a single-sample 2D destination".into());
+        }
+        let format = dst.pixel_format();
+        if !matches!(
+            format,
+            m::MTLPixelFormat::RGBA8Unorm | m::MTLPixelFormat::BGRA8Unorm
+        ) {
+            return Err(format!(
+                "Metal export requires RGBA8Unorm or BGRA8Unorm, got {format:?}"
+            ));
+        }
+        if src.pixel_format() != m::MTLPixelFormat::RGBA8Unorm {
+            return Err("Metal export source must be a resolved RGBA8 color texture".into());
+        }
+        if !dst.usage().is_empty() && !dst.usage().contains(m::MTLTextureUsage::RenderTarget) {
+            return Err("Metal export destination lacks render-target usage".into());
+        }
+        self.end_render_pass();
+        if !self.export_pipelines.contains_key(&(format as u64)) {
+            let shader = r#"#include <metal_stdlib>
+using namespace metal;
+struct ExportVarying { float4 position [[position]]; float2 uv; };
+vertex ExportVarying export_vertex(uint id [[vertex_id]], constant uint &flip [[buffer(0)]]) {
+    const float2 positions[3] = {float2(-1,-1),float2(3,-1),float2(-1,3)};
+    float2 p=positions[id]; ExportVarying out; out.position=float4(p,0,1);
+    out.uv=float2((p.x+1)*0.5,(1-p.y)*0.5);
+    if (flip != 0) out.uv.y=1-out.uv.y;
+    return out;
+}
+fragment float4 export_fragment(ExportVarying in [[stage_in]], texture2d<float> image [[texture(0)]]) {
+    constexpr sampler exactSampler(coord::normalized,address::clamp_to_edge,filter::nearest);
+    return image.sample(exactSampler,in.uv);
+}"#;
+            let library = self
+                .device
+                .new_library_with_source(shader, &m::CompileOptions::new())
+                .map_err(|e| format!("Metal export shader: {e}"))?;
+            let desc = m::RenderPipelineDescriptor::new();
+            let vertex = library.get_function("export_vertex", None)?;
+            let fragment = library.get_function("export_fragment", None)?;
+            desc.set_vertex_function(Some(&vertex));
+            desc.set_fragment_function(Some(&fragment));
+            desc.color_attachments()
+                .object_at(0)
+                .unwrap()
+                .set_pixel_format(format);
+            let pipeline = self
+                .device
+                .new_render_pipeline_state(&desc)
+                .map_err(|e| format!("Metal export pipeline: {e}"))?;
+            self.export_pipelines.insert(format as u64, pipeline);
+        }
+        let desc = m::RenderPassDescriptor::new();
+        let attachment = desc.color_attachments().object_at(0).unwrap();
+        attachment.set_texture(Some(dst));
+        attachment.set_load_action(m::MTLLoadAction::DontCare);
+        attachment.set_store_action(m::MTLStoreAction::Store);
+        let command = self.command().to_owned();
+        let encoder = command.new_render_command_encoder(&desc);
+        encoder.set_render_pipeline_state(self.export_pipelines.get(&(format as u64)).unwrap());
+        let flip = u32::from(flip_y);
+        encoder.set_vertex_bytes(0, 4, &flip as *const u32 as *const c_void);
+        encoder.set_fragment_texture(0, Some(&src));
+        encoder.draw_primitives(m::MTLPrimitiveType::Triangle, 0, 3);
+        encoder.end_encoding();
+        Ok(())
+    }
     pub fn delete_render_pass(&mut self, index: usize) {
-        self.finish();
+        if self.current_pass == Some(index) {
+            self.end_render_pass();
+            self.current_pass = None;
+            self.pipeline = None;
+        }
         self.passes[index].take();
     }
 }
 impl Drop for MetalContext {
     fn drop(&mut self) {
-        self.finish();
+        if let Err(error) = self.drain() {
+            eprintln!("{error}");
+        }
     }
+}
+
+fn render_key(params: PipelineParams) -> [u8; 9] {
+    let mask = color_mask(params.color_write).bits() as u8;
+    match params.color_blend {
+        None => [0, 0, 0, 0, 0, 0, 0, mask, 0],
+        Some(color) => {
+            let alpha = params.alpha_blend.unwrap_or(color);
+            [
+                1,
+                color.equation as u8,
+                blend_factor(color.sfactor) as u8,
+                blend_factor(color.dfactor) as u8,
+                alpha.equation as u8,
+                blend_factor(alpha.sfactor) as u8,
+                blend_factor(alpha.dfactor) as u8,
+                mask,
+                0,
+            ]
+        }
+    }
+}
+
+fn depth_key(params: PipelineParams) -> DepthKey {
+    let face = |f: StencilFaceState| {
+        [
+            f.fail_op as u32,
+            f.depth_fail_op as u32,
+            f.pass_op as u32,
+            f.test_func as u32,
+            f.test_mask,
+            f.write_mask,
+        ]
+    };
+    DepthKey {
+        comparison: params.depth_test as u8,
+        write: params.depth_write,
+        front: params.stencil_test.map(|s| face(s.front)),
+        back: params.stencil_test.map(|s| face(s.back)),
+    }
+}
+
+fn create_depth_state(device: &m::DeviceRef, params: PipelineParams) -> m::DepthStencilState {
+    let desc = m::DepthStencilDescriptor::new();
+    desc.set_depth_compare_function(comparison(params.depth_test));
+    desc.set_depth_write_enabled(params.depth_write);
+    if let Some(stencil) = params.stencil_test {
+        desc.set_front_face_stencil(Some(&stencil_face(stencil.front)));
+        desc.set_back_face_stencil(Some(&stencil_face(stencil.back)));
+    }
+    device.new_depth_stencil_state(&desc)
+}
+
+fn create_sampler(device: &m::DeviceRef, params: TextureParams) -> m::SamplerState {
+    let desc = m::SamplerDescriptor::new();
+    let filter = if params.filter == FilterMode::Nearest {
+        m::MTLSamplerMinMagFilter::Nearest
+    } else {
+        m::MTLSamplerMinMagFilter::Linear
+    };
+    desc.set_min_filter(filter);
+    desc.set_mag_filter(filter);
+    desc.set_mip_filter(match params.mipmap_filter {
+        MipmapFilter::None => m::MTLSamplerMipFilter::NotMipmapped,
+        MipmapFilter::Nearest => m::MTLSamplerMipFilter::Nearest,
+        MipmapFilter::Linear => m::MTLSamplerMipFilter::Linear,
+    });
+    let wrap = match params.wrap {
+        TextureWrap::Repeat => m::MTLSamplerAddressMode::Repeat,
+        TextureWrap::Mirror => m::MTLSamplerAddressMode::MirrorRepeat,
+        TextureWrap::Clamp => m::MTLSamplerAddressMode::ClampToEdge,
+    };
+    desc.set_address_mode_s(wrap);
+    desc.set_address_mode_t(wrap);
+    device.new_sampler(&desc)
 }
 
 fn color_mask(mask: ColorMask) -> m::MTLColorWriteMask {

@@ -60,6 +60,13 @@ pub fn translate(source: &str, stage: shaderc::ShaderKind) -> Result<String, Str
 /// 16-byte alignment and stride, including scalar arrays.
 pub fn pack(layout: &UniformBlockLayout, input: &[u8]) -> Vec<u8> {
     let mut output = Vec::new();
+    pack_into(layout, input, &mut output);
+    output
+}
+
+/// Reuse the caller's allocation while retaining zeroed std140 padding.
+pub fn pack_into(layout: &UniformBlockLayout, input: &[u8], output: &mut Vec<u8>) {
+    output.clear();
     let mut source = 0;
     for uniform in &layout.uniforms {
         let size = uniform.uniform_type.size() as usize;
@@ -91,7 +98,6 @@ pub fn pack(layout: &UniformBlockLayout, input: &[u8]) -> Vec<u8> {
         }
     }
     output.resize((output.len() + 15) / 16 * 16, 0);
-    output
 }
 
 #[cfg(test)]
@@ -116,6 +122,41 @@ mod tests {
         assert_eq!(&packed[0..4], &1u32.to_ne_bytes());
         assert_eq!(&packed[16..20], &2u32.to_ne_bytes());
         assert_eq!(&packed[32..36], &3u32.to_ne_bytes());
+    }
+    #[test]
+    fn reused_uniform_storage_clears_padding_and_shorter_blocks() {
+        let layout = UniformBlockLayout {
+            uniforms: vec![
+                UniformDesc::new("values", UniformType::Float1).array(2),
+                UniformDesc::new("tail", UniformType::Float1),
+            ],
+        };
+        let input = [1u32, 2, 3]
+            .iter()
+            .flat_map(|n| n.to_ne_bytes())
+            .collect::<Vec<_>>();
+        let mut output = vec![0xff; 128];
+        let capacity = output.capacity();
+        pack_into(&layout, &input, &mut output);
+        assert_eq!(output.len(), 48);
+        assert_eq!(output.capacity(), capacity);
+        assert_eq!(&output[..4], &1u32.to_ne_bytes());
+        assert_eq!(&output[16..20], &2u32.to_ne_bytes());
+        assert_eq!(&output[32..36], &3u32.to_ne_bytes());
+        assert!(output[4..16].iter().all(|&byte| byte == 0));
+        assert!(output[20..32].iter().all(|&byte| byte == 0));
+        assert!(output[36..48].iter().all(|&byte| byte == 0));
+        pack_into(
+            &UniformBlockLayout {
+                uniforms: vec![UniformDesc::new("short", UniformType::Float1)],
+            },
+            &4u32.to_ne_bytes(),
+            &mut output,
+        );
+        assert_eq!(output.len(), 16);
+        assert_eq!(output.capacity(), capacity);
+        assert_eq!(&output[..4], &4u32.to_ne_bytes());
+        assert!(output[4..].iter().all(|&byte| byte == 0));
     }
     #[test]
     fn translates_uniforms_and_samplers() {
