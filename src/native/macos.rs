@@ -165,12 +165,17 @@ impl WindowPayload {
     }
 }
 pub fn define_app_delegate() -> *const Class {
+    extern "C" fn terminate_after_last_window(_: &Object, _: Sel, _: ObjcId) -> BOOL {
+        // The independent event pump must return through its native/GPU cleanup
+        // instead of AppKit terminating before the handler can be dropped.
+        NO
+    }
     let superclass = class!(NSObject);
     let mut decl = ClassDecl::new("NSAppDelegate", superclass).unwrap();
     unsafe {
         decl.add_method(
             sel!(applicationShouldTerminateAfterLastWindowClosed:),
-            yes1 as extern "C" fn(&Object, Sel, ObjcId) -> BOOL,
+            terminate_after_last_window as extern "C" fn(&Object, Sel, ObjcId) -> BOOL,
         );
     }
 
