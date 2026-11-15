@@ -958,6 +958,29 @@ pub struct Context {
 }
 
 impl Context {
+    /// Create the native Vulkan window with its requested presentation interval.
+    pub(crate) fn new_vulkan(
+        window: (raw_window_handle::RawDisplayHandle, raw_window_handle::RawWindowHandle),
+        window_size: (u32, u32),
+        swap_interval: Option<i32>,
+    ) -> Context {
+        #[cfg(feature = "vulkan")]
+        {
+            Context {
+                backend: GraphicsBackend::Vulkan(vulkan::VulkanContext::new_with_swap_interval(
+                    window.0, window.1, window_size, swap_interval,
+                )),
+                features: Features { instancing: true, alpha_texture: false },
+                display: None,
+            }
+        }
+        #[cfg(not(feature = "vulkan"))]
+        {
+            let _ = (window, window_size, swap_interval);
+            panic!("Vulkan backend requested but the `vulkan` feature is not enabled")
+        }
+    }
+
     /// Create a context for the given backend.
     ///
     /// `window`/`display` are the raw handles used to build a Vulkan surface;

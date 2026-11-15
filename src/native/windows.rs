@@ -945,11 +945,10 @@ where
                 display.display_data.screen_width.max(0) as u32,
                 display.display_data.screen_height.max(0) as u32,
             );
-            crate::graphics::Context::new(
-                conf.platform.rendering_backend,
-                false,
-                Some((raw_display, raw_window)),
+            crate::graphics::Context::new_vulkan(
+                (raw_display, raw_window),
                 size,
+                conf.platform.swap_interval,
             )
         } else {
             crate::graphics::Context::new(

@@ -18,6 +18,7 @@ mod frame;
 mod resource;
 mod recording;
 mod submission;
+mod present;
 
 pub use resource::*;
 pub use recording::CommandRecordingStats;
@@ -143,6 +144,7 @@ pub image_available: Vec<vk::Semaphore>,
 
     pub window_size: (u32, u32),
     pub swapchain: vk::SwapchainKHR,
+    swap_interval: Option<i32>,
     pub swapchain_suboptimal: bool,
     pub surface_format: vk::SurfaceFormatKHR,
     pub swapchain_extent: vk::Extent2D,
@@ -274,6 +276,15 @@ impl VulkanContext {
         Self::build(Some((display, window)), window_size)
     }
 
+    pub(crate) fn new_with_swap_interval(
+        display: RawDisplayHandle,
+        window: RawWindowHandle,
+        window_size: (u32, u32),
+        swap_interval: Option<i32>,
+    ) -> VulkanContext {
+        Self::build_with_swap_interval(Some((display, window)), window_size, swap_interval)
+    }
+
     /// Headless Vulkan context: no surface, no swapchain, no window.
     ///
     /// The video exporter renders into its own offscreen targets and drives the
@@ -291,6 +302,14 @@ impl VulkanContext {
     fn build(
         surface_handles: Option<(RawDisplayHandle, RawWindowHandle)>,
         window_size: (u32, u32),
+    ) -> VulkanContext {
+        Self::build_with_swap_interval(surface_handles, window_size, None)
+    }
+
+    fn build_with_swap_interval(
+        surface_handles: Option<(RawDisplayHandle, RawWindowHandle)>,
+        window_size: (u32, u32),
+        swap_interval: Option<i32>,
     ) -> VulkanContext {
         unsafe {
             let entry = Entry::load().expect("Failed to load the Vulkan loader");
@@ -556,6 +575,7 @@ impl VulkanContext {
 
                 window_size,
                 swapchain: vk::SwapchainKHR::null(),
+                swap_interval,
                 swapchain_suboptimal: false,
                 surface_format: vk::SurfaceFormatKHR::default(),
                 swapchain_extent: vk::Extent2D::default(),
@@ -837,11 +857,19 @@ impl VulkanContext {
                 .surface_loader
                 .get_physical_device_surface_present_modes(self.physical_device, self.surface)
                 .unwrap();
-            let present_mode = present_modes
-                .iter()
-                .cloned()
-                .find(|mode| *mode == vk::PresentModeKHR::MAILBOX)
-                .unwrap_or(vk::PresentModeKHR::FIFO);
+            let present_mode = present::choose_present_mode(&present_modes, self.swap_interval);
+            if self.swap_interval == Some(0) && present_mode != vk::PresentModeKHR::IMMEDIATE {
+                crate::diagnostic!(2,
+                    "[miniquad][vulkan] IMMEDIATE presentation is unavailable; using {:?}, which presents at vertical blank. Supported modes: {:?}",
+                    present_mode, present_modes
+                );
+            }
+            if std::env::var_os("MINIQUAD_VULKAN_VERBOSE").is_some() {
+                crate::diagnostic!(3,
+                    "[miniquad][vulkan] swap_interval={:?}, present_mode={:?}, supported_modes={:?}",
+                    self.swap_interval, present_mode, present_modes
+                );
+            }
 
             let (width, height) = window_size;
             let requested_extent = vk::Extent2D {

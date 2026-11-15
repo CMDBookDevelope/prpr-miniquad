@@ -882,11 +882,10 @@ where
 
     let raw_display = raw_window_handle::RawDisplayHandle::Xlib(display_handle);
     let raw_window = raw_window_handle::RawWindowHandle::Xlib(window_handle);
-    let mut context = Context::new(
-        crate::conf::RenderingBackend::Vulkan,
-        false,
-        Some((raw_display, raw_window)),
+    let mut context = Context::new_vulkan(
+        (raw_display, raw_window),
         (width as u32, height as u32),
+        conf.platform.swap_interval,
     );
     let mut data = (f.take().unwrap())(context.with_display(&mut display));
 

@@ -530,14 +530,13 @@ where
             display_handle.display = wdisplay as *mut _;
             let mut window_handle = raw_window_handle::WaylandWindowHandle::empty();
             window_handle.surface = payload.display.surface as *mut _;
-            Context::new(
-                crate::conf::RenderingBackend::Vulkan,
-                false,
-                Some((
+            Context::new_vulkan(
+                (
                     raw_window_handle::RawDisplayHandle::Wayland(display_handle),
                     raw_window_handle::RawWindowHandle::Wayland(window_handle),
-                )),
+                ),
                 (drawable_width, drawable_height),
+                conf.platform.swap_interval,
             )
         } else {
             Context::new(
