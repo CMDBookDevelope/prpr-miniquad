@@ -14,6 +14,21 @@ use {
     std::{collections::HashMap, os::raw::c_void},
 };
 
+// QuartzCore's public three-float C struct. Objective-C passes this by value;
+// using an object/pointer declaration would corrupt the message ABI.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CAFrameRateRange {
+    minimum: f32,
+    maximum: f32,
+    preferred: f32,
+}
+unsafe impl Encode for CAFrameRateRange {
+    fn encode() -> Encoding {
+        unsafe { Encoding::from_str("{CAFrameRateRange=fff}") }
+    }
+}
+
 pub struct MacosDisplay {
     window: ObjcId,
     view: ObjcId,
@@ -26,6 +41,7 @@ pub struct MacosDisplay {
     cursor_shown: bool,
     current_cursor: CursorIcon,
     cursors: HashMap<CursorIcon, ObjcId>,
+    frame_source: Option<RcObjcId>,
 }
 impl crate::native::NativeDisplay for MacosDisplay {
     fn screen_size(&self) -> (f32, f32) {
@@ -116,6 +132,62 @@ impl crate::native::NativeDisplay for MacosDisplay {
 }
 
 impl MacosDisplay {
+    unsafe fn update_frame_rate(&self) {
+        let Some(source) = self.frame_source.as_ref() else {
+            return;
+        };
+        let source = source.as_id();
+        let supports_range: BOOL = msg_send![source,
+            respondsToSelector: sel!(setPreferredFrameRateRange:)];
+        if supports_range == NO {
+            return;
+        }
+        let screen: ObjcId = msg_send![self.window, screen];
+        let maximum: i64 = if screen.is_null() {
+            60
+        } else {
+            msg_send![screen, maximumFramesPerSecond]
+        };
+        let maximum = maximum.clamp(1, 120) as f32;
+        let range = CAFrameRateRange {
+            minimum: maximum.min(60.),
+            maximum,
+            preferred: maximum,
+        };
+        let () = msg_send![source, setPreferredFrameRateRange: range];
+    }
+
+    unsafe fn start_frame_updates(&mut self) {
+        let supports_display_link: BOOL = msg_send![self.view,
+            respondsToSelector: sel!(displayLinkWithTarget:selector:)];
+        // NSView's macOS 14+ link follows the window when it moves to another
+        // display. Earlier systems retain the existing timer plus OpenGL vsync.
+        let source: ObjcId = if supports_display_link != NO {
+            msg_send![self.view, displayLinkWithTarget: self.view selector: sel!(timerFired:)]
+        } else {
+            msg_send![class!(NSTimer),
+                timerWithTimeInterval: 0.001
+                target: self.view
+                selector: sel!(timerFired:)
+                userInfo: nil
+                repeats: true]
+        };
+        self.frame_source = Some(RcObjcId::from_unowned(NonNull::new(source).unwrap()));
+        self.update_frame_rate();
+        let run_loop: ObjcId = msg_send![class!(NSRunLoop), currentRunLoop];
+        if supports_display_link != NO {
+            let () = msg_send![source, addToRunLoop: run_loop forMode: NSRunLoopCommonModes];
+        } else {
+            let () = msg_send![run_loop, addTimer: source forMode: NSRunLoopCommonModes];
+        }
+    }
+
+    unsafe fn stop_frame_updates(&mut self) {
+        if let Some(source) = self.frame_source.take() {
+            let () = msg_send![source.as_id(), invalidate];
+        }
+    }
+
     fn transform_mouse_point(&self, point: &NSPoint) -> (f32, f32) {
         let new_x = point.x as f32 * self.data.dpi_scale;
         let new_y = self.data.screen_height as f32 - (point.y as f32 * self.data.dpi_scale) - 1.;
@@ -195,6 +267,7 @@ pub fn define_cocoa_window_delegate() -> *const Class {
             }
         }
         if payload.display.data.quit_ordered {
+            unsafe { payload.display.stop_frame_updates() };
             return YES;
         } else {
             return NO;
@@ -212,6 +285,7 @@ pub fn define_cocoa_window_delegate() -> *const Class {
 
     extern "C" fn window_did_change_screen(this: &Object, _: Sel, _: ObjcId) {
         let payload = get_window_payload(this);
+        unsafe { payload.display.update_frame_rate() };
         if let Some((w, h)) = unsafe { payload.display.update_dimensions() } {
             if let Some((context, event_handler)) = payload.context() {
                 event_handler.resize_event(context, w as _, h as _);
@@ -652,6 +726,7 @@ where
             cursor_shown: true,
             current_cursor: CursorIcon::Default,
             cursors: HashMap::new(),
+            frame_source: None,
         },
         f: Some(Box::new(f)),
         event_handler: None,
@@ -717,16 +792,6 @@ where
     payload.display.window = window;
     payload.display.view = view;
 
-    let nstimer: ObjcId = msg_send![
-        class!(NSTimer),
-        timerWithTimeInterval: 0.001
-        target: view
-        selector: sel!(timerFired:)
-        userInfo: nil
-        repeats: true
-    ];
-    let nsrunloop: ObjcId = msg_send![class!(NSRunLoop), currentRunLoop];
-    let () = msg_send![nsrunloop, addTimer: nstimer forMode: NSDefaultRunLoopMode];
     assert!(!view.is_null());
 
     let () = msg_send![window, setContentView: view];
@@ -737,6 +802,7 @@ where
     }
 
     let () = msg_send![window, makeKeyAndOrderFront: nil];
+    payload.display.start_frame_updates();
 
     let _ = payload.display.update_dimensions();
 
