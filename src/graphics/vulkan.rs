@@ -145,6 +145,7 @@ pub image_available: Vec<vk::Semaphore>,
     pub window_size: (u32, u32),
     pub swapchain: vk::SwapchainKHR,
     swap_interval: Option<i32>,
+    hdr_preference: Option<PresentationColorSpace>,
     pub swapchain_suboptimal: bool,
     pub surface_format: vk::SurfaceFormatKHR,
     pub swapchain_extent: vk::Extent2D,
@@ -267,6 +268,48 @@ unsafe extern "system" fn debug_callback(
     vk::FALSE
 }
 
+fn choose_surface_format(
+    formats: &[vk::SurfaceFormatKHR],
+    hdr: Option<PresentationColorSpace>,
+) -> vk::SurfaceFormatKHR {
+    if let Some(preferred) = hdr {
+        let transfers = if preferred == PresentationColorSpace::Rec2100Hlg {
+            [vk::ColorSpaceKHR::HDR10_HLG_EXT, vk::ColorSpaceKHR::HDR10_ST2084_EXT]
+        } else {
+            [vk::ColorSpaceKHR::HDR10_ST2084_EXT, vk::ColorSpaceKHR::HDR10_HLG_EXT]
+        };
+        for transfer in transfers {
+            if let Some(format) = formats.iter().find(|format| {
+                format.color_space == transfer
+                    && matches!(
+                        format.format,
+                        vk::Format::A2B10G10R10_UNORM_PACK32
+                            | vk::Format::A2R10G10B10_UNORM_PACK32
+                            | vk::Format::R16G16B16A16_SFLOAT
+                    )
+            }) {
+                return *format;
+            }
+        }
+        if let Some(format) = formats.iter().find(|format| {
+            format.color_space == vk::ColorSpaceKHR::EXTENDED_SRGB_LINEAR_EXT
+                && format.format == vk::Format::R16G16B16A16_SFLOAT
+        }) {
+            return *format;
+        }
+    }
+
+    let srgb = |format: &&vk::SurfaceFormatKHR| format.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR;
+    let mut format = *formats.iter().filter(srgb)
+        .find(|format| matches!(format.format, vk::Format::R8G8B8A8_UNORM | vk::Format::B8G8R8A8_UNORM))
+        .or_else(|| formats.iter().find(srgb))
+        .unwrap_or(&formats[0]);
+    if format.format == vk::Format::UNDEFINED {
+        format.format = vk::Format::B8G8R8A8_UNORM;
+    }
+    format
+}
+
 impl VulkanContext {
     pub fn new(
         display: RawDisplayHandle,
@@ -338,6 +381,23 @@ impl VulkanContext {
                 }
                 None => Vec::new(),
             };
+            let hdr_preference = match std::env::var("PRPR_PREVIEW_HDR").as_deref() {
+                Ok("rec2100_pq" | "rec2100-pq") => Some(PresentationColorSpace::Rec2100Pq),
+                Ok("rec2100_hlg" | "rec2100-hlg") => Some(PresentationColorSpace::Rec2100Hlg),
+                _ => None,
+            };
+            let colorspace_extension = vk::ExtSwapchainColorspaceFn::name();
+            let hdr_preference = hdr_preference.filter(|_| {
+                surface_handles.is_some()
+                    && entry
+                        .enumerate_instance_extension_properties(None)
+                        .is_ok_and(|extensions| extensions.iter().any(|extension| {
+                            CStr::from_ptr(extension.extension_name.as_ptr()) == colorspace_extension
+                        }))
+            });
+            if hdr_preference.is_some() {
+                extension_names.push(colorspace_extension.as_ptr());
+            }
             if validation {
                 extension_names.push(DebugUtils::name().as_ptr());
             }
@@ -577,6 +637,7 @@ impl VulkanContext {
                 swapchain: vk::SwapchainKHR::null(),
                 swap_interval,
                 swapchain_suboptimal: false,
+                hdr_preference,
                 surface_format: vk::SurfaceFormatKHR::default(),
                 swapchain_extent: vk::Extent2D::default(),
                 swapchain_images: Vec::new(),
@@ -808,6 +869,17 @@ impl VulkanContext {
     }
 
     /// (Re)create the swap chain and everything derived from it.
+    /// Color encoding the shader must produce for the current default framebuffer.
+    pub fn presentation_color_space(&self) -> PresentationColorSpace {
+        match self.surface_format.color_space {
+            vk::ColorSpaceKHR::HDR10_ST2084_EXT => PresentationColorSpace::Rec2100Pq,
+            vk::ColorSpaceKHR::HDR10_HLG_EXT => PresentationColorSpace::Rec2100Hlg,
+            vk::ColorSpaceKHR::EXTENDED_SRGB_LINEAR_EXT => PresentationColorSpace::ExtendedLinearSrgb,
+            _ if matches!(self.surface_format.format, vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_SRGB | vk::Format::A8B8G8R8_SRGB_PACK32) => PresentationColorSpace::LinearSrgb,
+            _ => PresentationColorSpace::Srgb,
+        }
+    }
+
     fn create_swapchain(&mut self, window_size: (u32, u32)) {
         self.drain_submissions();
         self.presentation_needs_recreate = false;
@@ -841,17 +913,7 @@ impl VulkanContext {
                 .surface_loader
                 .get_physical_device_surface_formats(self.physical_device, self.surface)
                 .unwrap();
-            // The swap chain format is what the default-frame-buffer pipelines
-            // get compiled against, so any 8-bit UNORM format works. Prefer one
-            // over an `_SRGB` variant, which would apply a gamma transfer the
-            // offscreen colour targets do not.
-            self.surface_format = *formats
-                .iter()
-                .find(|format| {
-                    format.format == vk::Format::R8G8B8A8_UNORM
-                        || format.format == vk::Format::B8G8R8A8_UNORM
-                })
-                .unwrap_or(&formats[0]);
+            self.surface_format = choose_surface_format(&formats, self.hdr_preference);
 
             let present_modes = self
                 .surface_loader

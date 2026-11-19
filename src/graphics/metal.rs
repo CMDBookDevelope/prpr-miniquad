@@ -108,7 +108,7 @@ pub struct MetalPipeline {
     pub params: PipelineParams,
     shader: usize,
     vertices: m::VertexDescriptor,
-    variants: HashMap<(u64, bool, [u8; 9]), m::RenderPipelineState>,
+    variants: HashMap<(u64, bool, m::MTLPixelFormat, [u8; 9]), m::RenderPipelineState>,
 }
 
 pub struct MetalContext {
@@ -122,6 +122,10 @@ pub struct MetalContext {
     pub pipelines: Vec<MetalPipeline>,
     pub passes: Vec<Option<MetalPass>>,
     default_color: Texture,
+    #[cfg(target_os = "macos")]
+    window_drawable: Option<m::MetalDrawable>,
+    #[cfg(target_os = "macos")]
+    window_edr_enabled: bool,
     current_pass: Option<usize>,
     pipeline: Option<usize>,
     index: Option<Buffer>,
@@ -135,7 +139,7 @@ pub struct MetalContext {
     depth_states: HashMap<DepthKey, m::DepthStencilState>,
     samplers: HashMap<(u8, u8, u8), m::SamplerState>,
     pub max_texture_size: u32,
-    scale_pipeline: Option<m::RenderPipelineState>,
+    scale_pipelines: HashMap<m::MTLPixelFormat, m::RenderPipelineState>,
     export_pipelines: HashMap<u64, m::RenderPipelineState>,
     #[cfg(feature = "metal-bench")]
     legacy_draw: bool,
@@ -171,6 +175,10 @@ impl MetalContext {
             pipelines: Vec::new(),
             passes: Vec::new(),
             default_color: Texture::empty(),
+            #[cfg(target_os = "macos")]
+            window_drawable: None,
+            #[cfg(target_os = "macos")]
+            window_edr_enabled: false,
             current_pass: None,
             pipeline: None,
             index: None,
@@ -182,7 +190,7 @@ impl MetalContext {
             depth_states: HashMap::new(),
             samplers: HashMap::new(),
             max_texture_size: 16384,
-            scale_pipeline: None,
+            scale_pipelines: HashMap::new(),
             export_pipelines: HashMap::new(),
             #[cfg(feature = "metal-bench")]
             legacy_draw: std::env::var("MINIQUAD_METAL_LEGACY_DRAW").is_ok_and(|v| v == "1"),
@@ -217,6 +225,22 @@ impl MetalContext {
         };
         context
     }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn set_window_drawable(&mut self, drawable: &m::MetalDrawableRef, edr_enabled: bool) {
+        self.window_edr_enabled = edr_enabled;
+        let texture = drawable.texture();
+        self.default_color.width = texture.width() as u32;
+        self.default_color.height = texture.height() as u32;
+        self.default_color.format = TextureFormat::RGBA16F;
+        self.textures[self.default_color.texture as usize].as_mut().unwrap().image = texture.to_owned();
+        self.window_drawable = Some(drawable.to_owned());
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn window_edr_enabled(&self) -> bool {
+        self.window_edr_enabled
+    }
+
     fn image(&self, index: usize) -> &m::TextureRef {
         &self.textures[index]
             .as_ref()
@@ -270,6 +294,10 @@ impl MetalContext {
         }
         self.command();
         let command = self.command.take().unwrap();
+        #[cfg(target_os = "macos")]
+        if let Some(drawable) = self.window_drawable.take() {
+            command.present_drawable(&drawable);
+        }
         command.commit();
         self.submitted.push_back(SubmittedBatch {
             command: command.clone(),
@@ -381,12 +409,14 @@ impl MetalContext {
         let pass = self.current_pass.map(|p| self.passes[p].as_ref().unwrap());
         let samples = pass.map_or(1, |p| p.samples as u64);
         let depth = pass.is_some_and(|p| p.depth.is_some());
+        let color = pass.map_or(self.default_color, |p| p.color);
+        let color_format = self.image(color.texture as usize).pixel_format();
         let entry = &mut self.pipelines[pipeline.0];
         let device = &self.device;
         let shader = &self.shaders[entry.shader];
         let params = entry.params;
         let vertices = &entry.vertices;
-        let key = (samples, depth, render_key(params));
+        let key = (samples, depth, color_format, render_key(params));
         #[cfg(feature = "metal-bench")]
         if !entry.variants.contains_key(&key) {
             self.bench_stats.pipeline_states += 1;
@@ -402,7 +432,7 @@ impl MetalContext {
                 desc.set_stencil_attachment_pixel_format(m::MTLPixelFormat::Depth32Float_Stencil8);
             }
             let color = desc.color_attachments().object_at(0).unwrap();
-            color.set_pixel_format(m::MTLPixelFormat::RGBA8Unorm);
+            color.set_pixel_format(color_format);
             color.set_write_mask(color_mask(params.color_write));
             if let Some(blend) = params.color_blend {
                 color.set_blending_enabled(true);
@@ -729,6 +759,8 @@ impl MetalContext {
         desc.set_height(params.height as u64);
         desc.set_pixel_format(if params.format == TextureFormat::Depth {
             m::MTLPixelFormat::Depth32Float_Stencil8
+        } else if params.format == TextureFormat::RGBA16F {
+            m::MTLPixelFormat::RGBA16Float
         } else {
             m::MTLPixelFormat::RGBA8Unorm
         });
@@ -858,6 +890,7 @@ impl MetalContext {
         let converted;
         let rgba: &[u8] = match format {
             TextureFormat::RGBA8 => bytes,
+            TextureFormat::RGBA16F => bytes,
             TextureFormat::RGB8 => {
                 converted = bytes
                     .chunks_exact(3)
@@ -885,7 +918,7 @@ impl MetalContext {
             m::MTLRegion::new_2d(x as u64, y as u64, w as u64, h as u64),
             0,
             rgba.as_ptr() as _,
-            w as u64 * 4,
+            w as u64 * if format == TextureFormat::RGBA16F { 8 } else { 4 },
         );
     }
     pub fn read_texture_pixels(
@@ -907,6 +940,15 @@ impl MetalContext {
             );
             return;
         }
+        if format == TextureFormat::RGBA16F {
+            self.image(index).get_bytes(
+                bytes.as_mut_ptr() as _,
+                w as u64 * 8,
+                m::MTLRegion::new_2d(0, 0, w as u64, h as u64),
+                0,
+            );
+            return;
+        }
         let mut rgba = vec![0u8; w as usize * h as usize * 4];
         self.image(index).get_bytes(
             rgba.as_mut_ptr() as _,
@@ -916,6 +958,7 @@ impl MetalContext {
         );
         match format {
             TextureFormat::RGBA8 => bytes.copy_from_slice(&rgba),
+            TextureFormat::RGBA16F => unreachable!(),
             TextureFormat::RGB8 => {
                 for (dst, src) in bytes.chunks_exact_mut(3).zip(rgba.chunks_exact(4)) {
                     dst.copy_from_slice(&src[..3]);
@@ -999,7 +1042,7 @@ impl MetalContext {
             let desc = m::TextureDescriptor::new();
             desc.set_width(color.width as u64);
             desc.set_height(color.height as u64);
-            desc.set_pixel_format(m::MTLPixelFormat::RGBA8Unorm);
+            desc.set_pixel_format(self.image(color.texture as usize).pixel_format());
             desc.set_texture_type(m::MTLTextureType::D2Multisample);
             desc.set_sample_count(samples as u64);
             desc.set_storage_mode(m::MTLStorageMode::Private);
@@ -1148,8 +1191,9 @@ impl MetalContext {
         self.end_render_pass();
         let src = self.image(source).to_owned();
         let dst = self.image(destination).to_owned();
-        if (src.width(), src.height()) != (dst.width(), dst.height()) {
-            if self.scale_pipeline.is_none() {
+        let format = dst.pixel_format();
+        if (src.width(), src.height(), src.pixel_format()) != (dst.width(), dst.height(), format) {
+            if !self.scale_pipelines.contains_key(&format) {
                 let source = r#"#include <metal_stdlib>
 using namespace metal;
 struct Varying { float4 position [[position]]; float2 uv; };
@@ -1176,8 +1220,9 @@ fragment float4 resize_fragment(Varying in [[stage_in]], texture2d<float> image 
                 desc.color_attachments()
                     .object_at(0)
                     .unwrap()
-                    .set_pixel_format(m::MTLPixelFormat::RGBA8Unorm);
-                self.scale_pipeline = Some(
+                    .set_pixel_format(format);
+                self.scale_pipelines.insert(
+                    format,
                     self.device
                         .new_render_pipeline_state(&desc)
                         .expect("Metal resize pipeline"),
@@ -1190,7 +1235,7 @@ fragment float4 resize_fragment(Varying in [[stage_in]], texture2d<float> image 
             attachment.set_store_action(m::MTLStoreAction::Store);
             let command = self.command().to_owned();
             let encoder = command.new_render_command_encoder(&desc);
-            encoder.set_render_pipeline_state(self.scale_pipeline.as_ref().unwrap());
+            encoder.set_render_pipeline_state(&self.scale_pipelines[&format]);
             encoder.set_fragment_texture(0, Some(&src));
             encoder.draw_primitives(m::MTLPrimitiveType::Triangle, 0, 3);
             encoder.end_encoding();

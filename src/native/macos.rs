@@ -14,6 +14,21 @@ use {
     std::{collections::HashMap, os::raw::c_void},
 };
 
+#[cfg(feature = "metal")]
+use metal_rs::{self as metal, foreign_types::ForeignTypeRef};
+
+#[cfg(feature = "metal")]
+#[link(name = "QuartzCore", kind = "framework")]
+extern "C" {}
+
+#[cfg(feature = "metal")]
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    static kCGColorSpaceExtendedLinearSRGB: ObjcId;
+    fn CGColorSpaceCreateWithName(name: ObjcId) -> ObjcId;
+    fn CGColorSpaceRelease(color_space: ObjcId);
+}
+
 pub struct MacosDisplay {
     window: ObjcId,
     view: ObjcId,
@@ -25,6 +40,8 @@ pub struct MacosDisplay {
     // unbalanced show_mouse() calls
     cursor_shown: bool,
     current_cursor: CursorIcon,
+    #[cfg(feature = "metal")]
+    metal_layer: Option<metal::MetalLayer>,
     cursors: HashMap<CursorIcon, ObjcId>,
 }
 impl crate::native::NativeDisplay for MacosDisplay {
@@ -265,7 +282,7 @@ pub fn define_cocoa_window_delegate() -> *const Class {
     return decl.register();
 }
 
-pub fn define_cocoa_view_class() -> *const Class {
+fn define_cocoa_view_class(metal: bool) -> *const Class {
     //extern "C" fn dealloc(this: &Object, _sel: Sel) {}
 
     extern "C" fn reshape(this: &Object, _sel: Sel) {
@@ -311,8 +328,9 @@ pub fn define_cocoa_view_class() -> *const Class {
 
         unsafe {
             let ctx: ObjcId = msg_send![this, openGLContext];
-            assert!(!ctx.is_null());
-            let () = msg_send![ctx, flushBuffer];
+            if !ctx.is_null() {
+                let () = msg_send![ctx, flushBuffer];
+            }
 
             if payload.display.data.quit_requested || payload.display.data.quit_ordered {
                 let () = msg_send![payload.display.window, performClose: nil];
@@ -434,16 +452,22 @@ pub fn define_cocoa_view_class() -> *const Class {
             }
         }
     }
-    let superclass = class!(NSOpenGLView);
-    let mut decl = ClassDecl::new("RenderViewClass", superclass).unwrap();
+    let (name, superclass) = if metal {
+        ("MetalRenderViewClass", class!(NSView))
+    } else {
+        ("RenderViewClass", class!(NSOpenGLView))
+    };
+    let mut decl = ClassDecl::new(name, superclass).unwrap();
     unsafe {
         //decl.add_method(sel!(dealloc), dealloc as extern "C" fn(&Object, Sel));
 
-        decl.add_method(sel!(reshape), reshape as extern "C" fn(&Object, Sel));
-        decl.add_method(
-            sel!(prepareOpenGL),
-            prepare_open_gl as extern "C" fn(&Object, Sel),
-        );
+        if !metal {
+            decl.add_method(sel!(reshape), reshape as extern "C" fn(&Object, Sel));
+            decl.add_method(
+                sel!(prepareOpenGL),
+                prepare_open_gl as extern "C" fn(&Object, Sel),
+            );
+        }
         decl.add_method(
             sel!(canBecomeKey),
             yes as extern "C" fn(&Object, Sel) -> BOOL,
@@ -457,10 +481,12 @@ pub fn define_cocoa_view_class() -> *const Class {
             sel!(resetCursorRects),
             reset_cursor_rects as extern "C" fn(&Object, Sel),
         );
-        decl.add_method(
-            sel!(drawRect:),
-            draw_rect as extern "C" fn(&Object, Sel, NSRect),
-        );
+        if !metal {
+            decl.add_method(
+                sel!(drawRect:),
+                draw_rect as extern "C" fn(&Object, Sel, NSRect),
+            );
+        }
         decl.add_method(
             sel!(mouseMoved:),
             mouse_moved as extern "C" fn(&Object, Sel, ObjcId),
@@ -616,7 +642,7 @@ unsafe fn create_opengl_view(
         panic!("macOS: Failed to create OpenGL context with any profile");
     }
 
-    let view_class = define_cocoa_view_class();
+    let view_class = define_cocoa_view_class(false);
     let view: ObjcId = msg_send![view_class, alloc];
     let view: ObjcId = msg_send![
         view,
@@ -633,10 +659,45 @@ unsafe fn create_opengl_view(
     view
 }
 
+#[cfg(feature = "metal")]
+unsafe fn draw_metal_window(payload: &mut WindowPayload) {
+        let layer = payload.display.metal_layer.as_ref().unwrap();
+    let width = payload.display.data.screen_width;
+    let height = payload.display.data.screen_height;
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    let native_layer = layer.as_ptr() as ObjcId;
+    let size = NSSize { width: width as f64, height: height as f64 };
+    let () = msg_send![native_layer, setDrawableSize: size];
+    let Some(drawable) = layer.next_drawable() else {
+        return;
+    };
+    let screen: ObjcId = msg_send![payload.display.window, screen];
+    let selector = sel!(maximumPotentialExtendedDynamicRangeColorComponentValue);
+    let supported: BOOL = msg_send![screen, respondsToSelector: selector];
+    let edr_enabled = supported == YES && {
+        let headroom: f64 = msg_send![screen, maximumPotentialExtendedDynamicRangeColorComponentValue];
+        headroom > 1.0
+    };
+    payload.context.as_mut().unwrap().metal().set_window_drawable(drawable, edr_enabled);
+
+    if let Some((context, event_handler)) = payload.context() {
+        event_handler.update(context);
+        event_handler.draw(context);
+    }
+
+    if payload.display.data.quit_requested || payload.display.data.quit_ordered {
+        let () = msg_send![payload.display.window, performClose: nil];
+    }
+}
+
 pub unsafe fn run<F>(conf: crate::conf::Conf, f: F)
 where
     F: 'static + FnOnce(&mut crate::Context) -> Box<dyn EventHandler>,
 {
+    let use_metal = cfg!(feature = "metal")
+        && conf.platform.rendering_backend == crate::conf::RenderingBackend::Metal;
     let mut payload = WindowPayload {
         swap_interval: conf.platform.swap_interval.unwrap_or(1),
         display: MacosDisplay {
@@ -649,6 +710,8 @@ where
             fullscreen: false,
             cursor_shown: true,
             current_cursor: CursorIcon::Default,
+            #[cfg(feature = "metal")]
+            metal_layer: None,
             cursors: HashMap::new(),
         },
         f: Some(Box::new(f)),
@@ -705,12 +768,12 @@ where
     let () = msg_send![window, center];
     let () = msg_send![window, setAcceptsMouseMovedEvents: YES];
 
-    let view = create_opengl_view(
-        window_frame,
-        conf.sample_count,
-        conf.high_dpi,
-        conf.platform.opengl_version,
-    );
+    let view: ObjcId = if use_metal {
+        let view: ObjcId = msg_send![define_cocoa_view_class(true), alloc];
+        msg_send![view, initWithFrame: window_frame]
+    } else {
+        create_opengl_view(window_frame, conf.sample_count, conf.high_dpi, conf.platform.opengl_version)
+    };
     (*view).set_ivar("display_ptr", &mut payload as *mut _ as *mut c_void);
 
     payload.display.window = window;
@@ -728,6 +791,29 @@ where
     let () = msg_send![window, makeKeyAndOrderFront: nil];
 
     let _ = payload.display.update_dimensions();
+
+    #[cfg(feature = "metal")]
+    if use_metal {
+        let size = (payload.display.data.screen_width.max(1) as u32, payload.display.data.screen_height.max(1) as u32);
+        let mut context = Context::new(crate::conf::RenderingBackend::Metal, false, None, size);
+        let layer = metal::MetalLayer::new();
+        layer.set_device(&context.metal().device);
+        layer.set_pixel_format(metal::MTLPixelFormat::RGBA16Float);
+        layer.set_wants_extended_dynamic_range_content(true);
+        layer.set_opaque(true);
+        layer.set_display_sync_enabled(payload.swap_interval != 0);
+        let color_space = CGColorSpaceCreateWithName(kCGColorSpaceExtendedLinearSRGB);
+        let () = msg_send![layer.as_ptr() as ObjcId, setColorspace: color_space];
+        if !color_space.is_null() {
+            CGColorSpaceRelease(color_space);
+        }
+        let () = msg_send![view, setWantsLayer: YES];
+        let () = msg_send![view, setLayer: layer.as_ptr() as ObjcId];
+        payload.display.metal_layer = Some(layer);
+        payload.context = Some(context);
+        let f = payload.f.take().unwrap();
+        payload.event_handler = Some(f(payload.context.as_mut().unwrap().with_display(&mut payload.display)));
+    }
 
     let ns_app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
     let () = msg_send![ns_app, finishLaunching];
@@ -765,8 +851,14 @@ where
             let visible: BOOL = msg_send![window, isVisible];
             let miniaturized: BOOL = msg_send![window, isMiniaturized];
             if visible != NO && miniaturized == NO {
-                let () = msg_send![view, setNeedsDisplay: YES];
-                let () = msg_send![view, displayIfNeeded];
+                #[cfg(feature = "metal")]
+                if use_metal {
+                    draw_metal_window(&mut payload);
+                }
+                if !use_metal {
+                    let () = msg_send![view, setNeedsDisplay: YES];
+                    let () = msg_send![view, displayIfNeeded];
+                }
             }
         }
         let () = msg_send![pool, drain];
@@ -777,9 +869,11 @@ where
     let () = msg_send![ns_app, setDelegate: nil];
     let () = msg_send![window, close];
     // GPU resource drops still have the view's current OpenGL context.
-    let ctx: ObjcId = msg_send![view, openGLContext];
-    if !ctx.is_null() {
-        let () = msg_send![ctx, makeCurrentContext];
+    if !use_metal {
+        let ctx: ObjcId = msg_send![view, openGLContext];
+        if !ctx.is_null() {
+            let () = msg_send![ctx, makeCurrentContext];
+        }
     }
     drop(payload.event_handler.take());
     drop(payload.context.take());

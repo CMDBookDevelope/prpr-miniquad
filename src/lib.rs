@@ -224,9 +224,11 @@ where
 {
     #[cfg(feature = "metal")]
     if conf.platform.rendering_backend == conf::RenderingBackend::Metal {
-        assert!(conf.headless, "Metal chart rendering uses an offscreen context");
-        native::offscreen::run(&conf, f);
-        return;
+        if conf.headless {
+            native::offscreen::run(&conf, f);
+            return;
+        }
+        assert!(cfg!(target_os = "macos"), "Metal native window presentation requires macOS");
     }
     #[cfg(target_env = "ohos")]
     unsafe {

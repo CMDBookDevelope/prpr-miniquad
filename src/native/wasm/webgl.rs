@@ -59,6 +59,7 @@ pub const GL_LINK_STATUS: u32 = 0x8B82;
 pub const GL_TEXTURE_CUBE_MAP_POSITIVE_Y: u32 = 0x8517;
 pub const GL_SAMPLE_ALPHA_TO_COVERAGE: u32 = 0x809E;
 pub const GL_RGBA16F: u32 = 0x881A;
+pub const GL_HALF_FLOAT: u32 = 0x140B;
 pub const GL_CONSTANT_ALPHA: u32 = 0x8003;
 pub const GL_READ_FRAMEBUFFER: u32 = 0x8CA8;
 pub const GL_TEXTURE0: u32 = 0x84C0;

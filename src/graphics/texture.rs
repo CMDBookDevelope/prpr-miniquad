@@ -65,6 +65,8 @@ pub enum TextureFormat {
     Depth,
     Alpha,
     LuminanceAlpha,
+    /// Four-channel IEEE-754 binary16 texture, primarily for HDR render targets.
+    RGBA16F,
 }
 
 impl TextureFormat {
@@ -73,6 +75,7 @@ impl TextureFormat {
         match self {
             TextureFormat::RGB8 => (GL_RGB, GL_RGB, GL_UNSIGNED_BYTE),
             TextureFormat::RGBA8 => (GL_RGBA, GL_RGBA, GL_UNSIGNED_BYTE),
+            TextureFormat::RGBA16F => (GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT),
             TextureFormat::Depth => (GL_DEPTH_COMPONENT, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT),
 
             #[cfg(target_arch = "wasm32")]
@@ -101,10 +104,21 @@ impl TextureFormat {
         match self {
             TextureFormat::RGB8 => 3 * square,
             TextureFormat::RGBA8 => 4 * square,
+            TextureFormat::RGBA16F => 8 * square,
             TextureFormat::Depth => 2 * square,
             TextureFormat::Alpha => 1 * square,
             TextureFormat::LuminanceAlpha => 2 * square,
         }
+    }
+}
+
+#[cfg(test)]
+mod texture_format_tests {
+    use super::TextureFormat;
+
+    #[test]
+    fn rgba16f_size_is_eight_bytes_per_pixel() {
+        assert_eq!(TextureFormat::RGBA16F.size(3, 2), 48);
     }
 }
 

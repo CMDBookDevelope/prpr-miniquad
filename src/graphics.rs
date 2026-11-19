@@ -17,6 +17,17 @@ pub use texture::{
     FilterMode, MipmapFilter, Texture, TextureAccess, TextureFormat, TextureParams, TextureWrap,
 };
 
+/// Transfer and primaries expected by the native window's swapchain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresentationColorSpace {
+    Srgb,
+    LinearSrgb,
+    Rec2100Pq,
+    Rec2100Hlg,
+    ExtendedLinearSrgb,
+    AppleEdr,
+}
+
 fn get_uniform_location(program: GLuint, name: &str) -> Option<i32> {
     let cname = CString::new(name).unwrap_or_else(|e| panic!("{}", e));
     let location = unsafe { glGetUniformLocation(program, cname.as_ptr()) };

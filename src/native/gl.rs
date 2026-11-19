@@ -104,6 +104,7 @@ pub const GL_TEXTURE_CUBE_MAP_POSITIVE_X: u32 = 0x8515;
 pub const GL_DECR: u32 = 0x1E03;
 pub const GL_FRAGMENT_SHADER: u32 = 0x8B30;
 pub const GL_FLOAT: u32 = 0x1406;
+pub const GL_HALF_FLOAT: u32 = 0x140B;
 pub const GL_TEXTURE_MAX_LOD: u32 = 0x813B;
 pub const GL_DEPTH_COMPONENT: u32 = 0x1902;
 pub const GL_ONE_MINUS_DST_ALPHA: u32 = 0x0305;

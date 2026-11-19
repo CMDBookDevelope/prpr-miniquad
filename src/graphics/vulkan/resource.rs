@@ -1822,6 +1822,7 @@ pub fn vk_format(format: TextureFormat) -> vk::Format {
     match format {
         TextureFormat::RGB8 => vk::Format::R8G8B8_UNORM,
         TextureFormat::RGBA8 => vk::Format::R8G8B8A8_UNORM,
+        TextureFormat::RGBA16F => vk::Format::R16G16B16A16_SFLOAT,
         TextureFormat::Depth => DEPTH_FORMAT,
         TextureFormat::Alpha => vk::Format::R8_UNORM,
         TextureFormat::LuminanceAlpha => vk::Format::R8G8_UNORM,
