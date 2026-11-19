@@ -972,6 +972,22 @@ impl VulkanContext {
             mipmap_filter,
         };
         let fresh = self.new_texture(bytes, params, access);
+        let old_view = self.textures[index]
+            .sample_view
+            .unwrap_or(self.textures[index].view);
+        let replacement = &self.textures[fresh];
+        let replacement_info = vk::DescriptorImageInfo {
+            sampler: replacement.sampler,
+            image_view: replacement.sample_view.unwrap_or(replacement.view),
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        };
+        // A resize preserves the texture's public index, but not its Vulkan
+        // view or sampler. Keep bindings prepared for the next draw valid.
+        for info in self.pending.images.iter_mut().flatten() {
+            if info.image_view == old_view {
+                *info = replacement_info;
+            }
+        }
         self.destroy_texture(index);
         let module = std::mem::replace(&mut self.textures[fresh], empty_texture_module());
         self.textures[index] = module;
@@ -996,6 +1012,19 @@ impl VulkanContext {
             return;
         }
         self.synchronize_resources();
+        // Synchronization finishes recorded draws, but close_pass deliberately
+        // retains the sampled list for the next layout transition. In
+        // particular, growing the glyph cache can delete a texture between
+        // two uploads in the same frame. Remove its pending references before
+        // replacing the module with null handles.
+        self.pending.sampled.retain(|&sampled| sampled != index);
+        let module = &self.textures[index];
+        let view = module.sample_view.unwrap_or(module.view);
+        for info in &mut self.pending.images {
+            if info.as_ref().is_some_and(|info| info.image_view == view) {
+                *info = None;
+            }
+        }
         self.destroy_texture(index);
         self.textures[index] = empty_texture_module();
     }
