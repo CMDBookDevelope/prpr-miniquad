@@ -2743,8 +2743,9 @@ impl ElapsedQuery {
 
     /// Reports whenever elapsed timer is supported and other methods can be invoked.
     pub fn is_supported() -> bool {
-        unimplemented!();
-        //unsafe { sapp_is_elapsed_timer_supported() }
+        // Result retrieval is not implemented by this fork. Do not start a
+        // timer query that cannot be collected or may lack GL entry points.
+        false
     }
 
     /// Reports whenever result of submitted query is available for retrieval with

@@ -152,6 +152,28 @@ impl MetalContext {
     pub fn native_device(&self) -> *mut c_void {
         self.device.as_ptr() as *mut c_void
     }
+    /// Return a borrowed native handle to a live miniquad texture.
+    ///
+    /// # Safety
+    /// The pointer is valid only while this context and texture remain alive;
+    /// callers must keep both alive for every encoded GPU access.
+    pub unsafe fn native_texture(&self, texture: Texture) -> Result<*mut c_void, String> {
+        self.textures
+            .get(texture.texture as usize)
+            .and_then(Option::as_ref)
+            .map(|texture| texture.image.as_ptr() as *mut c_void)
+            .ok_or_else(|| "Metal texture is deleted or invalid".into())
+    }
+    /// End active render encoding and return the current uncommitted queue command.
+    /// Additional native encoders recorded on it are submitted by `submit()`.
+    ///
+    /// # Safety
+    /// The borrowed pointer is valid until the next `submit`/`finish`/drop on
+    /// this context. Native encoders must be ended before that point.
+    pub unsafe fn native_command_buffer(&mut self) -> *mut c_void {
+        self.end_render_pass();
+        self.command().as_ptr() as *mut c_void
+    }
     pub fn gpu_info() -> Option<(String, Vec<u32>)> {
         let device = m::Device::system_default()?;
         let counts = [1, 2, 4, 8, 16, 32, 64]
@@ -327,8 +349,11 @@ impl MetalContext {
         self.recycle_buffers(unused);
         error.map_or(Ok(()), Err)
     }
+    pub fn try_finish(&mut self) -> Result<(), String> {
+        self.drain()
+    }
     pub fn finish(&mut self) {
-        self.drain().expect("Metal GPU completion failed");
+        self.try_finish().expect("Metal GPU completion failed");
     }
     #[cfg(feature = "metal-bench")]
     pub fn bench_stats(&self) -> MetalBenchStats {
