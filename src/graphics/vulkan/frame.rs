@@ -629,6 +629,35 @@ impl VulkanContext {
     /// image and then copied that image to the buffer.  The intermediate copy
     /// is unnecessary: Y is R8, UV is RG8, so two `cmd_copy_image_to_buffer`
     /// calls already produce exactly the NV12 layout ffmpeg expects.
+    /// Copy a packed RGBA8 export image into caller-owned coherent staging.
+    /// Unlike read_pixels this is queued with the current frame and does not
+    /// wait or reverse rows. The caller owns storage until the frame fence and
+    /// any CPU reader complete.
+    pub fn record_rgba_copy_to_staging(&mut self, index: usize, buffer_raw: u64, width: u32, height: u32) {
+        assert!(self.offscreen && self.frame_active, "RGBA staging copy requires an active offscreen frame");
+        assert_eq!(self.textures[index].format, vk::Format::R8G8B8A8_UNORM);
+        self.close_pass();
+        self.flush_draw_commands();
+        let command = self.command_buffers[self.acquired_image.unwrap()];
+        let image = self.textures[index].image;
+        let layout = self.textures[index].layout;
+        let staging = vk::Buffer::from_raw(buffer_raw);
+        unsafe {
+            self.barrier(command, image, vk::ImageAspectFlags::COLOR, layout, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+            let region = vk::BufferImageCopy::builder()
+                .image_subresource(vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 })
+                .image_extent(vk::Extent3D { width, height, depth: 1 }).build();
+            self.device.cmd_copy_image_to_buffer(command, image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, staging, &[region]);
+            self.barrier(command, image, vk::ImageAspectFlags::COLOR, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, layout);
+            let host = vk::BufferMemoryBarrier::builder()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(staging).offset(0).size(width as u64 * height as u64 * 4).build();
+            self.device.cmd_pipeline_barrier(command, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(), &[], &[host], &[]);
+        }
+    }
+
     pub fn record_yuv_copy_to_staging(
         &mut self,
         y_index: usize,
